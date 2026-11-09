@@ -1,0 +1,171 @@
+# 📷 Câmera Pessoal — Análise de Movimento & Câmera Térmica Simulada
+
+Sistema de visão computacional em Python projetado para operar **localmente** utilizando a sua **câmera pessoal (webcam USB/integrada como `/dev/video0`)** para captar e analisar movimentos em tempo real, permitir a troca dinâmica de resolução e taxa de quadros (FPS), e simular o fluxo da sua própria câmera como se fosse uma **câmera térmica infravermelha profissional (FLIR/Termografia)**.
+
+---
+
+## 🚀 Principais Funcionalidades
+
+1. **Captura Direta da Câmera Pessoal (`source="camera"`)**:
+   - Inicia instantaneamente com a sua webcam local (padrão `/dev/video0`), com detecção automática de câmeras e reconexão amigável.
+   - Opção de **espelhamento horizontal (`mirror=True`)** para visualização natural no estilo espelho.
+   - Fallback de segurança elegante caso nenhuma câmera física esteja conectada.
+
+2. **Detecção e Rastreamento de Movimentos em Tempo Real**:
+   - Algoritmos selecionáveis:
+     - `frame_diff`: Diferença adaptativa de quadros com compensação de iluminação ambiente.
+     - `mog2`: Mistura Gaussiana de fundo com adaptação dinâmica.
+     - `knn`: K-Nearest Neighbors para separação de primeiro plano e fundo.
+   - Ajuste em tempo real de **sensibilidade (1% a 100%)**, **área mínima do objeto (px²)** e **limiar de alarme**.
+   - Caixas delimitadoras (*Bounding Boxes*), vetor e rastro de trajetória do movimento.
+   - **Região de Interesse (ROI)** interativa: desenhe a área monitorada diretamente na tela clicando e arrastando o mouse sobre o vídeo.
+
+3. **Simulador de Câmera Térmica Infravermelha (IR)**:
+   - Converte o vídeo real da sua webcam em termografia com **7 paletas termográficas**:
+     - `inferno` (FLIR Ironbow / padrão industrial)
+     - `jet` (escala arco-íris clássica)
+     - `turbo` (arco-íris aprimorado pelo Google)
+     - `hot` (gradiente preto-vermelho-amarelo-branco)
+     - `plasma`
+     - `bone` (White-Hot estilo visão noturna militar)
+     - `magma`
+   - **Perfis Rápidos de Temperatura**:
+     - *Corporal / Pessoal* (`20°C a 42°C`): otimizado para temperatura da pele humana.
+     - *Ambiente* (`18°C a 65°C`): para objetos e movimentação em salas e escritórios.
+     - *Alta Temperatura* (`22°C a 120°C`): simulações com superfícies quentes.
+   - **Simulação de Calor Cinético por Movimento**: áreas que se movimentam na frente da câmera geram calor cinético residual simulando fricção ou atividade física com taxa de decaimento térmico ajustável.
+   - Rastreamento automático de **Hotspot** (ponto mais quente) e **Coldspot** (ponto mais frio) com coordenadas e temperatura em °C.
+   - Isoterma crítica e barra de escala termográfica graduada.
+
+4. **Controle Dinâmico de Resolução e FPS**:
+   - Alterne instantaneamente entre resoluções pré-definidas (`320x240`, `640x480`, `800x600`, `960x540`, `1280x720`, `1920x1080`) ou defina uma resolução personalizada.
+   - Controle dinâmico de taxa de quadros de **1 a 60 FPS** com sincronização temporal precisa.
+
+5. **4 Modos de Visão**:
+   - `normal`: Vídeo RGB original com caixas e rastreamento de movimento.
+   - `thermal`: Visão termográfica simulada completa.
+   - `hybrid`: Fusão termo-óptica (imagem real translúcida sobreposta ao mapa térmico com contornos destacados).
+   - `motion_mask`: Máscara binária de primeiro plano isolando o que está em movimento.
+
+---
+
+## 📦 Instalação e Requisitos
+
+### Pré-requisitos
+- **Python 3.10 ou superior**
+- Sistema Linux, macOS ou Windows
+- Webcam USB ou câmera integrada
+- Pacote Tkinter (no Ubuntu/Debian: `sudo apt install python3-tk`)
+
+### Clonando o Repositório
+```bash
+git clone https://github.com/Robertkevyngg/camera-movimento-termica.git
+cd camera-movimento-termica
+```
+
+### Criando o Ambiente Virtual e Instalando Dependências
+Com `uv` (recomendado):
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+```
+
+Ou com `pip` convencional:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## 🖥️ Como Executar
+
+### 1. Aplicativo Desktop Nativo (Recomendado)
+Para abrir diretamente o aplicativo com interface gráfica nativa:
+
+```bash
+./run_app.sh
+```
+
+Ou diretamente pelo Python:
+```bash
+python desktop_app.py
+```
+
+Opções de inicialização personalizada:
+```bash
+# Iniciar em HD 720p a 30 FPS no modo Câmera Térmica:
+python desktop_app.py --resolution 1280x720 --fps 30 --mode thermal
+
+# Iniciar no modo Híbrido com paleta Turbo:
+python desktop_app.py --mode hybrid --palette turbo
+```
+
+#### Atalhos do Teclado no App Desktop:
+- `1` : Modo Câmera Pessoal (Normal)
+- `2` : Modo Câmera Térmica Simulada
+- `3` : Modo Fusão Híbrida
+- `4` : Modo Máscara de Movimento
+- `M` : Alternar Espelhamento da Webcam
+- `ESC` : Fechar aplicativo
+
+---
+
+### 2. Painel Web Local (FastAPI + Stream MJPEG)
+Se preferir visualizar e controlar pelo navegador:
+
+```bash
+python main.py --host 127.0.0.1 --port 8000
+```
+Acesse no seu navegador: **http://127.0.0.1:8000**
+
+---
+
+### 3. Modo Janela Rápida OpenCV
+Para uma visualização leve diretamente via OpenCV:
+
+```bash
+python main.py --desktop-gui --resolution 640x480 --fps 30 --mode thermal
+```
+
+---
+
+## 🧪 Testes Automatizados
+
+O projeto conta com uma suíte de 79 testes automatizados cobrindo API, CLI, app desktop, simulador térmico e detector de movimento:
+
+```bash
+pytest --cov=app --cov-report=term-missing -v
+```
+
+---
+
+## 📁 Estrutura do Projeto
+
+```
+sistema-visao-industrial/
+├── app/
+│   ├── api.py               # Servidor Web local FastAPI e stream MJPEG
+│   ├── camera_manager.py    # Orquestrador de captura da webcam e telemetria
+│   ├── cli.py               # Interface de linha de comando
+│   ├── config.py            # Modelos de configuração imutáveis (Pydantic)
+│   ├── desktop_app.py       # Aplicativo Desktop Nativo (Tkinter SCADA)
+│   ├── hud_renderer.py      # Renderizador de camadas e informações na tela
+│   ├── motion_detector.py   # Motor de detecção e rastreamento de movimento
+│   ├── thermal_simulator.py # Motor de simulação termográfica infravermelha
+│   └── static/              # Interface Web (HTML5/CSS3/JavaScript)
+├── desktop_app.py           # Atalho de inicialização do app desktop
+├── main.py                  # Ponto de entrada unificado
+├── pyproject.toml           # Configuração de pacote Python
+├── requirements.txt         # Lista de dependências
+├── run_app.sh               # Script de execução rápida do app local
+└── tests/                   # Suíte de testes unitários e de integração
+```
+
+---
+
+## 📄 Licença
+
+Distribuído sob a licença MIT. Sinta-se livre para usar, modificar e distribuir para fins pessoais, acadêmicos ou comerciais.

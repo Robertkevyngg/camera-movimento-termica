@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sistema de Visão Industrial — Detecção de Movimento & Termografia Simulada</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <div>
+        <h1>Câmera Pessoal — Análise de Movimento &amp; Câmera Térmica Simulada</h1>
+        <p>Sistema de Visão Industrial &amp; Pessoal: Captura de Movimentos Reais, Controle de Resolução/FPS e Simulador Térmico</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="badge-source" class="badge badge-info">FONTE: CÂMERA PESSOAL</span>
+      <span id="badge-alert" class="badge badge-normal">STATUS: NORMAL</span>
+      <button id="btn-reconnect-cam" class="btn btn-secondary" type="button">Reconectar Câmera</button>
+      <button id="btn-recalibrate" class="btn btn-secondary" type="button">Recalibrar Fundo</button>
+      <a id="btn-snapshot" class="btn btn-primary" href="/api/snapshot" download="snapshot-camera.jpg" target="_blank">Capturar Snapshot</a>
+    </div>
+  </header>
+
+  <main class="dashboard-grid">
+    <!-- Coluna Esquerda: Vídeo Ao Vivo + Telemetria + Log -->
+    <section class="viewport-column">
+      <div class="card video-card">
+        <div class="card-header">
+          <div class="mode-tabs" role="tablist">
+            <button type="button" class="mode-tab active" data-mode="normal">1. Câmera Pessoal (Normal)</button>
+            <button type="button" class="mode-tab" data-mode="thermal">2. Simular Câmera Térmica</button>
+            <button type="button" class="mode-tab" data-mode="hybrid">3. Fusão (Câmera + Térmica)</button>
+            <button type="button" class="mode-tab" data-mode="motion_mask">4. Rastreador de Movimento</button>
+          </div>
+          <div class="stream-meta">
+            <span id="stream-res-label">640x480 @ 24 FPS</span>
+          </div>
+        </div>
+
+        <div class="video-wrapper">
+          <img id="video-stream" src="/api/stream" alt="Stream da Câmera Pessoal" />
+        </div>
+
+        <div class="anomaly-bar">
+          <span class="anomaly-label">Perfis Térmicos &amp; Testes:</span>
+          <button type="button" class="btn btn-primary" data-thermal-profile="human">
+            Perfil Corporal (20–42°C)
+          </button>
+          <button type="button" class="btn btn-secondary" data-thermal-profile="ambient">
+            Perfil Ambiente (18–65°C)
+          </button>
+          <button type="button" class="btn btn-danger-outline" data-anomaly="thermal_spike">
+            Teste Pico Térmico
+          </button>
+          <button type="button" class="btn btn-warn-outline" data-anomaly="intrusion">
+            Teste Movimento
+          </button>
+          <button type="button" class="btn btn-secondary" data-anomaly="clear">
+            Limpar Testes
+          </button>
+        </div>
+      </div>
+
+      <!-- KPIs de Telemetria em Tempo Real -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <span class="kpi-title">Taxa de Quadros & Latência</span>
+          <strong id="kpi-fps" class="kpi-value">24.0 / 24 FPS</strong>
+          <span id="kpi-latency" class="kpi-sub">Processamento: 1.5 ms</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-title">Detecção de Movimento</span>
+          <strong id="kpi-motion" class="kpi-value">0.0%</strong>
+          <span id="kpi-objects" class="kpi-sub">0 objetos ativos</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-title">Termografia Simulada (Hotspot)</span>
+          <strong id="kpi-temp-max" class="kpi-value">45.0 °C</strong>
+          <span id="kpi-temp-range" class="kpi-sub">Mín: 22.0°C | Méd: 31.0°C</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-title">Resolução Ativa</span>
+          <strong id="kpi-resolution" class="kpi-value">640 x 480</strong>
+          <span id="kpi-coords" class="kpi-sub">Hotspot: (0, 0)</span>
+        </div>
+      </div>
+
+      <!-- Log de Eventos -->
+      <div class="card events-card">
+        <div class="card-header">
+          <h2>Registro de Eventos e Alarmes da Planta</h2>
+          <button id="btn-clear-events" type="button" class="btn btn-sm btn-secondary">Limpar Histórico</button>
+        </div>
+        <div id="events-list" class="events-list"></div>
+      </div>
+    </section>
+
+    <!-- Coluna Direita: Painéis de Controle -->
+    <aside class="controls-column">
+      <!-- Painel 1: Câmera, Resolução e FPS -->
+      <div class="card control-card">
+        <h2>1. Câmera Pessoal, Resolução &amp; FPS</h2>
+
+        <div class="form-row">
+          <label for="ctrl-source">Fonte de Vídeo</label>
+          <select id="ctrl-source">
+            <option value="camera" selected>Câmera Pessoal Local (Webcam / V4L2)</option>
+            <option value="simulator">Modo Teste Sintético (Fallback)</option>
+          </select>
+        </div>
+
+        <div class="form-row two-cols">
+          <div>
+            <label for="ctrl-camera-index">Índice da Câmera (/dev/videoN)</label>
+            <input id="ctrl-camera-index" type="number" min="0" max="10" value="0" />
+          </div>
+          <div>
+            <label for="ctrl-scenario">Cenário de Teste</label>
+            <select id="ctrl-scenario">
+              <option value="conveyor">Esteira</option>
+              <option value="machinery">Motores</option>
+              <option value="perimeter">Perímetro</option>
+              <option value="boiler">Caldeira</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row checkbox-group">
+          <label><input id="ctrl-mirror" type="checkbox" checked /> Espelhar Câmera Pessoal (Modo Webcam)</label>
+        </div>
+
+        <div class="form-row">
+          <label for="ctrl-res-preset">Preset de Resolução</label>
+          <select id="ctrl-res-preset">
+            <option value="320x240">320 x 240 (QVGA - Baixa Latência)</option>
+            <option value="640x480" selected>640 x 480 (VGA Padrão)</option>
+            <option value="800x600">800 x 600 (SVGA Industrial)</option>
+            <option value="960x540">960 x 540 (qHD Widescreen)</option>
+            <option value="1280x720">1280 x 720 (HD 720p)</option>
+            <option value="1920x1080">1920 x 1080 (Full HD 1080p)</option>
+          </select>
+        </div>
+
+        <div class="form-row two-cols">
+          <div>
+            <label for="ctrl-width">Largura (px)</label>
+            <input id="ctrl-width" type="number" min="160" max="3840" step="16" value="640" />
+          </div>
+          <div>
+            <label for="ctrl-height">Altura (px)</label>
+            <input id="ctrl-height" type="number" min="120" max="2160" step="16" value="480" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label for="ctrl-fps">
+            Taxa de Quadros Alvo (FPS): <strong id="lbl-fps">24 FPS</strong>
+          </label>
+          <input id="ctrl-fps" type="range" min="1" max="60" value="24" />
+          <div class="preset-chips">
+            <button type="button" class="chip" data-fps="5">5 FPS</button>
+            <button type="button" class="chip" data-fps="10">10 FPS</button>
+            <button type="button" class="chip" data-fps="15">15 FPS</button>
+            <button type="button" class="chip active" data-fps="24">24 FPS</button>
+            <button type="button" class="chip" data-fps="30">30 FPS</button>
+            <button type="button" class="chip" data-fps="60">60 FPS</button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label for="ctrl-sim-speed">
+            Velocidade da Simulação: <strong id="lbl-sim-speed">1.0x</strong>
+          </label>
+          <input id="ctrl-sim-speed" type="range" min="0.2" max="3.0" step="0.1" value="1.0" />
+        </div>
+      </div>
+
+      <!-- Painel 2: Câmera Térmica Simulada -->
+      <div class="card control-card">
+        <h2>2. Câmera Térmica Simulada (IR)</h2>
+
+        <div class="form-row">
+          <label for="ctrl-palette">Paleta Termográfica</label>
+          <select id="ctrl-palette">
+            <option value="inferno">Inferno (Ironbow Industrial FLIR)</option>
+            <option value="jet">Jet (Arco-Íris Termográfico)</option>
+            <option value="turbo">Turbo (Alto Contraste Térmico)</option>
+            <option value="hot">Hot (Incandescente)</option>
+            <option value="plasma">Plasma (Infravermelho Industrial)</option>
+            <option value="bone">Bone (White-Hot Monocromático)</option>
+            <option value="magma">Magma</option>
+          </select>
+        </div>
+
+        <div class="form-row three-cols">
+          <div>
+            <label for="ctrl-temp-min">Temp. Mín (°C)</label>
+            <input id="ctrl-temp-min" type="number" min="-40" max="300" step="1" value="22" />
+          </div>
+          <div>
+            <label for="ctrl-temp-max">Temp. Máx (°C)</label>
+            <input id="ctrl-temp-max" type="number" min="0" max="1000" step="5" value="120" />
+          </div>
+          <div>
+            <label for="ctrl-temp-alarm">Alarme (°C)</label>
+            <input id="ctrl-temp-alarm" type="number" min="0" max="1000" step="1" value="85" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label for="ctrl-kinetic-heat">
+            Calor Cinético por Movimento: <strong id="lbl-kinetic">45%</strong>
+          </label>
+          <input id="ctrl-kinetic-heat" type="range" min="0" max="1" step="0.05" value="0.45" />
+        </div>
+
+        <div class="form-row checkbox-group">
+          <label><input id="ctrl-show-hotspots" type="checkbox" checked /> Miras Hotspot / Coldspot</label>
+          <label><input id="ctrl-show-isotherms" type="checkbox" checked /> Contorno de Isoterma Crítica</label>
+          <label><input id="ctrl-show-scale" type="checkbox" checked /> Barra de Escala (°C)</label>
+        </div>
+      </div>
+
+      <!-- Painel 3: Detecção de Movimento & Zona ROI -->
+      <div class="card control-card">
+        <h2>3. Detecção de Movimento & Zona ROI</h2>
+
+        <div class="form-row">
+          <label for="ctrl-algorithm">Algoritmo de Subtração de Fundo</label>
+          <select id="ctrl-algorithm">
+            <option value="frame_diff">Diferença Adaptativa (FrameDiff)</option>
+            <option value="mog2">Mistura Gaussiana (MOG2)</option>
+            <option value="knn">K-Nearest Neighbors (KNN)</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <label for="ctrl-sensitivity">
+            Sensibilidade do Sensor: <strong id="lbl-sensitivity">65%</strong>
+          </label>
+          <input id="ctrl-sensitivity" type="range" min="1" max="100" value="65" />
+        </div>
+
+        <div class="form-row two-cols">
+          <div>
+            <label for="ctrl-min-area">Área Mínima (px²)</label>
+            <input id="ctrl-min-area" type="number" min="10" max="50000" step="10" value="250" />
+          </div>
+          <div>
+            <label for="ctrl-alarm-pct">Limiar Alarme (% área)</label>
+            <input id="ctrl-alarm-pct" type="number" min="0.5" max="100" step="0.5" value="3.5" />
+          </div>
+        </div>
+
+        <div class="form-row checkbox-group">
+          <label><input id="ctrl-motion-boxes" type="checkbox" checked /> Exibir Bounding Boxes</label>
+          <label><input id="ctrl-motion-trails" type="checkbox" checked /> Exibir Trilha de Movimento</label>
+          <label><input id="ctrl-roi-enabled" type="checkbox" /> Restringir à Zona ROI</label>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

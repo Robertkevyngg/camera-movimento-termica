@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Câmera Pessoal — Movimento & Câmera Térmica Simulada
+Comment=Captura e análise de movimentos pela câmera pessoal com controle de Resolução/FPS e Simulador de Câmera Térmica
+Exec=/home/robert/sistema-visao-industrial/run_app.sh
+Path=/home/robert/sistema-visao-industrial
+Terminal=false
+Categories=Science;Engineering;
