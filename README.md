@@ -101,7 +101,22 @@ python desktop_app.py --resolution 1280x720 --fps 30 --mode thermal
 
 # Iniciar no modo Híbrido com paleta Turbo:
 python desktop_app.py --mode hybrid --palette turbo
+
+# Computador modesto: modo leve (320x240 @ 15 FPS, sem trilhas de movimento)
+python desktop_app.py --lite
 ```
+
+#### Desempenho em computadores modestos
+- **Modo Leve**: use `--lite` ou o botão **Modo Leve (PC fraco)** abaixo do vídeo.
+- A câmera é lida em uma thread separada, então a janela não congela se a webcam
+  estiver lenta, em pouca luz ou desconectada (aparece "Conectando a camera..." e,
+  após 2 s sem imagem, o simulador de fallback).
+- Movimento e termografia são analisados em no máximo 320 px de largura; o vídeo
+  exibido continua na resolução escolhida.
+- Os painéis de telemetria atualizam 4x por segundo e a lista de eventos 2x por
+  segundo, em vez de a cada quadro.
+- Com **Pillow** instalado o vídeo é desenhado cerca de 4x mais rápido; sem ele o
+  app funciona pelo caminho PPM, mais lento.
 
 #### Atalhos do Teclado no App Desktop:
 - `1` : Modo Câmera Pessoal (Normal)
@@ -148,10 +163,12 @@ pytest --cov=app --cov-report=term-missing -v
 sistema-visao-industrial/
 ├── app/
 │   ├── api.py               # Servidor Web local FastAPI e stream MJPEG
+│   ├── camera_capture.py    # Captura da webcam em thread dedicada (não trava a interface)
 │   ├── camera_manager.py    # Orquestrador de captura da webcam e telemetria
 │   ├── cli.py               # Interface de linha de comando
 │   ├── config.py            # Modelos de configuração imutáveis (Pydantic)
 │   ├── desktop_app.py       # Aplicativo Desktop Nativo (Tkinter SCADA)
+│   ├── frame_utils.py       # Análise em resolução reduzida e percentis por histograma
 │   ├── hud_renderer.py      # Renderizador de camadas e informações na tela
 │   ├── motion_detector.py   # Motor de detecção e rastreamento de movimento
 │   ├── thermal_simulator.py # Motor de simulação termográfica infravermelha

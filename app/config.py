@@ -48,6 +48,13 @@ THERMAL_PROFILE_PRESETS: dict[str, dict[str, float]] = {
     },
 }
 
+# Perfil para computadores modestos: menos pixels e menos quadros por segundo.
+LITE_MODE_PATCH: dict[str, Any] = {
+    "resolution_preset": "320x240",
+    "target_fps": 15,
+    "motion": {"show_trails": False},
+}
+
 VisionMode = Literal["normal", "thermal", "hybrid", "motion_mask"]
 MotionAlgorithm = Literal["frame_diff", "mog2", "knn"]
 ThermalPalette = Literal["inferno", "jet", "hot", "turbo", "plasma", "bone", "magma"]

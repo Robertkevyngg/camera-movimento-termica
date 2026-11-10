@@ -108,24 +108,45 @@
     );
   }
 
+  const SEVERITY_CLASSES = ["NORMAL", "ATENCAO", "CRITICO"];
+  const POLL_INTERVAL_MS = 1000;
+  let lastEventsSignature = null;
+
+  function buildEventRow(ev) {
+    const row = document.createElement("div");
+    row.className = "event-item";
+    if (SEVERITY_CLASSES.includes(ev.severity)) {
+      row.classList.add(ev.severity);
+    }
+    const body = document.createElement("span");
+    const category = document.createElement("strong");
+    category.textContent = `[${ev.category}]`;
+    body.append(category, ` ${ev.message}`);
+    const time = document.createElement("span");
+    time.className = "event-time";
+    time.textContent = new Date(ev.timestamp_iso).toLocaleTimeString("pt-BR");
+    row.append(body, time);
+    return row;
+  }
+
   function renderEvents(items) {
-    const container = el("events-list");
-    if (!items || items.length === 0) {
-      container.innerHTML = `<div class="event-item"><span>Nenhum evento registrado.</span></div>`;
+    const visible = (items || []).slice(0, 15);
+    const signature = visible.map((ev) => ev.id).join(",");
+    if (signature === lastEventsSignature) {
       return;
     }
-    container.innerHTML = items
-      .slice(0, 15)
-      .map((ev) => {
-        const timeStr = new Date(ev.timestamp_iso).toLocaleTimeString("pt-BR");
-        return `
-          <div class="event-item ${ev.severity}">
-            <span><strong>[${ev.category}]</strong> ${ev.message}</span>
-            <span class="event-time">${timeStr}</span>
-          </div>
-        `;
-      })
-      .join("");
+    lastEventsSignature = signature;
+    const container = el("events-list");
+    if (visible.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "event-item";
+      empty.append(Object.assign(document.createElement("span"), {
+        textContent: "Nenhum evento registrado.",
+      }));
+      container.replaceChildren(empty);
+      return;
+    }
+    container.replaceChildren(...visible.map(buildEventRow));
   }
 
   function bindEvents() {
@@ -305,7 +326,12 @@
       syncControlsFromConfig(cfgRes.data);
     }
     await refreshTelemetryAndEvents();
-    setInterval(refreshTelemetryAndEvents, 650);
+    setInterval(() => {
+      // Aba em segundo plano não precisa consultar o servidor.
+      if (!document.hidden) {
+        refreshTelemetryAndEvents();
+      }
+    }, POLL_INTERVAL_MS);
   }
 
   document.addEventListener("DOMContentLoaded", init);

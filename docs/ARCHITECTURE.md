@@ -32,4 +32,6 @@ O sistema segue uma arquitetura modular em camadas com estado de configuração 
 - `app/thermal_simulator.py`: Simulador termográfico que combina luminância calibrada, difusão térmica, acúmulo de calor por movimento (fricção/energia cinética), mapeamento linear para graus Celsius (`°C`), detecção de extremos térmicos (`hotspot` / `coldspot`) e aplicação de colormaps industriais.
 - `app/hud_renderer.py`: Renderizador de sobreposição visual (HUD SCADA) com caixas delimitadoras, zona ROI, mira no ponto mais quente, barra de escala térmica em `°C` e indicadores de alarme.
 - `app/camera_manager.py`: Controlador de captura e processamento com troca dinâmica de resolução/FPS, fallback automático de câmera física para simulador, histórico de eventos e captura de snapshots.
+- `app/camera_capture.py`: Thread dedicada que abre a câmera e lê quadros continuamente; o `CameraManager` só consulta o quadro mais recente, sem bloquear a interface em leituras lentas ou em câmera ausente.
+- `app/frame_utils.py`: Redução do quadro para a resolução de análise (largura máxima de 320 px) e cálculo de percentis por histograma, usados por movimento e termografia.
 - `app/api.py`: Servidor FastAPI fornecendo endpoints RESTful, stream de vídeo MJPEG (`/api/stream`) e arquivos estáticos da interface SCADA.

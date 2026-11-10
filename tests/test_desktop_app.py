@@ -349,3 +349,60 @@ def test_headless_display_error_closes_manager_and_returns_clean_error(monkeypat
     assert rc == 1
     err_out = capsys.readouterr().err
     assert "Erro ao iniciar aplicativo desktop" in err_out
+
+
+def test_throttled_step_refreshes_video_every_frame_but_panels_on_interval(tmp_path: Path, monkeypatch):
+    import tkinter as tk
+
+    import app.desktop_app as desktop_module
+
+    manager = CameraManager(SystemConfig(source="simulator", width=320, height=240))
+    try:
+        app = IndustrialVisionDesktopApp(manager=manager, snapshot_dir=tmp_path, start_hidden=True)
+    except tk.TclError:
+        manager.close()
+        pytest.skip("Ambiente gráfico indisponível")
+    try:
+        panel_updates: list[int] = []
+        original_update = app._update_telemetry_widgets
+        monkeypatch.setattr(
+            app,
+            "_update_telemetry_widgets",
+            lambda tel: (panel_updates.append(tel.frame_index), original_update(tel))[1],
+        )
+        monkeypatch.setattr(desktop_module, "TELEMETRY_REFRESH_SEC", 60.0)
+        monkeypatch.setattr(desktop_module, "EVENTS_REFRESH_SEC", 60.0)
+
+        first = app.step_once(throttled=True)
+        video_item = app._video_item_id
+        for _ in range(5):
+            app.step_once(throttled=True)
+
+        assert panel_updates == [first.frame_index]
+        assert app._video_item_id == video_item
+        assert len(app.canvas.find_withtag("video_frame")) == 1
+
+        unthrottled = app.step_once()
+        assert panel_updates[-1] == unthrottled.frame_index
+    finally:
+        app.close()
+
+
+def test_lite_mode_button_applies_low_cost_profile(tmp_path: Path):
+    import tkinter as tk
+
+    manager = CameraManager(SystemConfig(source="simulator", width=640, height=480, target_fps=30))
+    try:
+        app = IndustrialVisionDesktopApp(manager=manager, snapshot_dir=tmp_path, start_hidden=True)
+    except tk.TclError:
+        manager.close()
+        pytest.skip("Ambiente gráfico indisponível")
+    try:
+        assert app.apply_lite_mode() is True
+
+        cfg = manager.get_config()
+        assert (cfg.width, cfg.height, cfg.target_fps) == (320, 240, 15)
+        assert cfg.motion.show_trails is False
+        assert app.res_preset_var.get() == "320x240"
+    finally:
+        app.close()

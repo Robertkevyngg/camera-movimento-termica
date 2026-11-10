@@ -10,6 +10,9 @@ from app.motion_detector import MotionResult
 from app.thermal_simulator import PALETTE_MAP, ThermalResult
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+STATUS_BAR_HEIGHT = 30
+STATUS_BAR_COLOR = (16, 20, 26)
+MASK_BACKGROUND_DIM = 0.22
 
 
 class HudRenderer:
@@ -25,11 +28,11 @@ class HudRenderer:
         alert_level: AlertLevel,
     ) -> np.ndarray:
         """Compõe o quadro final sem mutar os arrays de entrada."""
-        base = self._compose_base_frame(raw_bgr, motion, thermal, config)
+        # _compose_base_frame sempre devolve um array novo, seguro para desenhar por cima.
+        canvas = self._compose_base_frame(raw_bgr, motion, thermal, config)
         if not config.hud_enabled:
-            return base
+            return canvas
 
-        canvas = base.copy()
         height, width = canvas.shape[:2]
 
         if config.roi.enabled:
@@ -59,23 +62,28 @@ class HudRenderer:
         config: SystemConfig,
     ) -> np.ndarray:
         mode = config.vision_mode
+        if mode == "motion_mask":
+            return self._compose_motion_mask_frame(raw_bgr, motion.motion_mask)
+        thermal_bgr = thermal.thermal_bgr
+        if thermal_bgr is None or mode == "normal":
+            return raw_bgr.copy()
         if mode == "thermal":
-            return thermal.thermal_bgr.copy()
+            return thermal_bgr.copy()
         if mode == "hybrid":
-            blended = cv2.addWeighted(raw_bgr, 0.35, thermal.thermal_bgr, 0.65, 0)
-            if np.any(motion.motion_mask):
+            blended = cv2.addWeighted(raw_bgr, 0.35, thermal_bgr, 0.65, 0)
+            if cv2.countNonZero(motion.motion_mask):
                 contours, _ = cv2.findContours(
                     motion.motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
                 )
                 cv2.drawContours(blended, contours, -1, (120, 255, 120), 2)
             return blended
-        if mode == "motion_mask":
-            dark_bg = (raw_bgr.astype(np.float32) * 0.22).astype(np.uint8)
-            mask_color = np.zeros_like(raw_bgr)
-            mask_color[:, :, 1] = motion.motion_mask
-            mask_color[:, :, 2] = motion.motion_mask // 3
-            return cv2.add(dark_bg, mask_color)
         return raw_bgr.copy()
+
+    @staticmethod
+    def _compose_motion_mask_frame(raw_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        dark_bg = cv2.convertScaleAbs(raw_bgr, alpha=MASK_BACKGROUND_DIM)
+        mask_color = cv2.merge((np.zeros_like(mask), mask, mask // 3))
+        return cv2.add(dark_bg, mask_color)
 
     def _draw_roi_zone(
         self, canvas: np.ndarray, width: int, height: int, config: SystemConfig
@@ -216,10 +224,10 @@ class HudRenderer:
         actual_fps: float,
         alert_level: AlertLevel,
     ) -> None:
-        bar_h = 30
-        overlay = canvas.copy()
-        cv2.rectangle(overlay, (0, 0), (width, bar_h), (16, 20, 26), -1)
-        cv2.addWeighted(overlay, 0.78, canvas, 0.22, 0, dst=canvas)
+        # Mistura só a faixa da barra, em vez de copiar e misturar o quadro inteiro.
+        bar = canvas[: min(STATUS_BAR_HEIGHT, height)]
+        tint = np.full_like(bar, STATUS_BAR_COLOR)
+        cv2.addWeighted(tint, 0.78, bar, 0.22, 0, dst=bar)
 
         src_tag = f"CAM#{config.camera_index}" if config.source == "camera" else "SIM"
         summary = (

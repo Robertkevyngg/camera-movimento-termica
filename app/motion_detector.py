@@ -9,13 +9,26 @@ import cv2
 import numpy as np
 
 from app.config import BoundingBox, MotionAlgorithm, MotionConfig, ROIConfig
+from app.frame_utils import compute_analysis_size, downscale_for_analysis, gray_percentiles
 
 MAX_TRAIL_POINTS = 32
+# A dilatação original engrossa a máscara ~4 px por lado em resolução cheia.
+# Na análise reduzida cada pixel vale `fator` pixels, então a dilatação diminui
+# na mesma proporção para as caixas não crescerem.
+SINGLE_DILATE_FACTOR = 1.5
+SMALL_KERNEL_FACTOR = 3.0
+KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+KERNEL_DILATE = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+KERNEL_DILATE_SMALL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
 
 @dataclass(frozen=True)
 class MotionResult:
-    """Resultado imutável do processamento de movimento de um quadro."""
+    """Resultado imutável do processamento de movimento de um quadro.
+
+    A detecção roda em resolução reduzida; caixas, trilhas e a máscara são
+    devolvidas na escala do quadro original.
+    """
 
     motion_detected: bool
     alarm_triggered: bool
@@ -69,21 +82,28 @@ class MotionDetector:
         if not config.enabled:
             return self._empty_result(width, height)
 
-        self._ensure_model_state(width, height, config)
+        small_w, small_h, factor = compute_analysis_size(width, height)
+        self._ensure_model_state(small_w, small_h, config)
         if (
             not is_new_frame
             and self._last_raw_mask is not None
-            and self._last_raw_mask.shape == (height, width)
+            and self._last_raw_mask.shape == (small_h, small_w)
         ):
             raw_mask = self._last_raw_mask
         else:
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            small_bgr = downscale_for_analysis(frame_bgr, (small_w, small_h))
+            gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
             blurred = cv2.GaussianBlur(gray, (config.blur_size, config.blur_size), 0)
-            raw_mask = self._compute_foreground_mask(blurred, config)
+            raw_mask = self._compute_foreground_mask(blurred, config, factor)
             self._last_raw_mask = raw_mask
 
-        filtered_mask, active_area = self._apply_roi_mask(raw_mask, width, height, roi)
-        boxes = self._extract_bounding_boxes(filtered_mask, config.min_area)
+        small_mask, active_area = self._apply_roi_mask(raw_mask, small_w, small_h, roi)
+        boxes = self._extract_bounding_boxes(small_mask, config.min_area, factor)
+        filtered_mask = (
+            small_mask
+            if factor == 1.0
+            else cv2.resize(small_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        )
 
         if boxes and is_new_frame:
             largest = boxes[0]
@@ -91,7 +111,7 @@ class MotionDetector:
             if not self._trails or self._trails[-1] != pt:
                 self._trails.append(pt)
 
-        motion_pixels = int(np.count_nonzero(filtered_mask))
+        motion_pixels = int(cv2.countNonZero(small_mask))
         motion_pct = round((motion_pixels / max(1, active_area)) * 100.0, 2)
         motion_detected = len(boxes) > 0
         alarm_triggered = motion_detected and (motion_pct >= config.alarm_motion_pct)
@@ -150,7 +170,7 @@ class MotionDetector:
         return None
 
     def _compute_foreground_mask(
-        self, blurred_gray: np.ndarray, config: MotionConfig
+        self, blurred_gray: np.ndarray, config: MotionConfig, factor: float = 1.0
     ) -> np.ndarray:
         if config.algorithm == "frame_diff":
             if self._bg_float is None:
@@ -161,7 +181,8 @@ class MotionDetector:
             frame_delta = cv2.absdiff(blurred_gray, bg_uint8)
             cv2.accumulateWeighted(blurred_gray, self._bg_float, 0.08)
 
-            scene_scale = min(1.0, max(0.55, float(np.percentile(blurred_gray, 75)) / 140.0))
+            (brightness_p75,) = gray_percentiles(blurred_gray, (75.0,))
+            scene_scale = min(1.0, max(0.55, brightness_p75 / 140.0))
             base_thresh = max(5, int(65 - config.sensitivity * 0.56))
             thresh_val = max(
                 8 if config.sensitivity < 90 else 5,
@@ -179,11 +200,11 @@ class MotionDetector:
             fg = self._subtractor.apply(blurred_gray)
             _, mask = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
 
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
-        dilated = cv2.dilate(opened, kernel_dilate, iterations=2)
-        return dilated
+        opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL_OPEN, iterations=1)
+        if factor >= SMALL_KERNEL_FACTOR:
+            return cv2.dilate(opened, KERNEL_DILATE_SMALL, iterations=1)
+        dilate_iters = 1 if factor >= SINGLE_DILATE_FACTOR else 2
+        return cv2.dilate(opened, KERNEL_DILATE, iterations=dilate_iters)
 
     def _apply_roi_mask(
         self,
@@ -201,17 +222,18 @@ class MotionDetector:
         return roi_filtered, max(1, rw * rh)
 
     def _extract_bounding_boxes(
-        self, mask: np.ndarray, min_area: int
+        self, mask: np.ndarray, min_area: int, factor: float = 1.0
     ) -> tuple[BoundingBox, ...]:
+        """Extrai caixas da máscara de análise e as converte para a escala original."""
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         boxes: list[BoundingBox] = []
         for contour in contours:
-            area = float(cv2.contourArea(contour))
+            area = float(cv2.contourArea(contour)) * factor * factor
             if area < min_area:
                 continue
-            x, y, w, h = cv2.boundingRect(contour)
+            x, y, w, h = (round(v * factor) for v in cv2.boundingRect(contour))
             boxes.append(
                 BoundingBox(
                     x=int(x),

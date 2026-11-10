@@ -12,6 +12,9 @@ from app.config import SimulatorConfig
 
 AnomalyType = Literal["thermal_spike", "intrusion", "clear"]
 VALID_ANOMALIES: tuple[str, ...] = ("thermal_spike", "intrusion", "clear")
+# Campos de ruído pré-gerados e alternados a cada quadro: sortear ruído gaussiano
+# em resolução cheia a cada quadro custava mais que todo o resto do simulador.
+NOISE_POOL_SIZE = 3
 
 
 def _add_gaussian_hotspot(
@@ -48,6 +51,9 @@ class IndustrialSceneSimulator:
             "thermal_spike": 0,
             "intrusion": 0,
         }
+        self._backdrop: np.ndarray | None = None
+        self._noise_pool: tuple[np.ndarray, ...] = ()
+        self._noise_key: tuple[tuple[int, ...], float] | None = None
 
     def trigger_anomaly(self, kind: AnomalyType, duration_frames: int = 45) -> None:
         """Ativa ou limpa uma anomalia simulada por N quadros."""
@@ -73,7 +79,7 @@ class IndustrialSceneSimulator:
         self._step += 1
         t = self._step * 0.08 * config.speed_multiplier
 
-        canvas = self._create_industrial_backdrop(width, height)
+        canvas = self._get_backdrop(width, height).copy()
         heat_map = np.full(
             (height, width), float(config.ambient_heat_factor) * 0.45, dtype=np.float32
         )
@@ -91,8 +97,7 @@ class IndustrialSceneSimulator:
         self._decrement_anomalies()
 
         if config.noise_level > 0.0:
-            noise = self._rng.normal(0.0, config.noise_level, size=canvas.shape)
-            canvas = np.clip(canvas.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+            canvas = self._apply_sensor_noise(canvas, float(config.noise_level))
 
         return canvas, np.clip(heat_map, 0.0, 1.0)
 
@@ -117,6 +122,27 @@ class IndustrialSceneSimulator:
         for key in ("thermal_spike", "intrusion"):
             if self._anomaly_frames[key] > 0:
                 self._anomaly_frames[key] -= 1
+
+    def _get_backdrop(self, width: int, height: int) -> np.ndarray:
+        """Devolve o fundo estático em cache (recriado só quando a resolução muda)."""
+        if self._backdrop is None or self._backdrop.shape[:2] != (height, width):
+            self._backdrop = self._create_industrial_backdrop(width, height)
+        return self._backdrop
+
+    def _apply_sensor_noise(self, canvas: np.ndarray, noise_level: float) -> np.ndarray:
+        key = (canvas.shape, round(noise_level, 2))
+        if self._noise_key != key:
+            self._noise_pool = tuple(
+                np.clip(
+                    np.rint(self._rng.standard_normal(canvas.shape, dtype=np.float32) * noise_level),
+                    -127,
+                    127,
+                ).astype(np.int8)
+                for _ in range(NOISE_POOL_SIZE)
+            )
+            self._noise_key = key
+        noise = self._noise_pool[self._step % NOISE_POOL_SIZE]
+        return cv2.add(canvas, noise, dtype=cv2.CV_8U)
 
     def _create_industrial_backdrop(self, width: int, height: int) -> np.ndarray:
         canvas = np.full((height, width, 3), (34, 38, 42), dtype=np.uint8)

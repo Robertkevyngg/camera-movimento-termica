@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
+import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -41,11 +43,24 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
     """Cria e configura a aplicação FastAPI com todas as rotas SCADA."""
     cam_manager = manager or CameraManager()
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            # Avisa os streams abertos antes de liberar a câmera, para não reabri-la.
+            _app.state.shutting_down = True
+            cam_manager.close()
+
     app = FastAPI(
         title="Sistema de Visão Industrial — Movimento & Termografia Simulada",
         version="1.0.0",
+        lifespan=lifespan,
     )
     app.state.camera_manager = cam_manager
+    app.state.shutting_down = False
+    # As rotas abaixo que tocam a câmera são síncronas de propósito: o FastAPI as
+    # executa no pool de threads, e o processamento de vídeo não trava o laço de eventos.
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -55,7 +70,7 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
         return FileResponse(STATIC_DIR / "index.html")
 
     @app.get("/api/health")
-    async def health() -> dict[str, Any]:
+    def health() -> dict[str, Any]:
         cfg = cam_manager.get_config()
         return _ok_envelope(
             {
@@ -68,7 +83,7 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
         )
 
     @app.get("/api/presets")
-    async def get_presets() -> dict[str, Any]:
+    def get_presets() -> dict[str, Any]:
         return _ok_envelope(
             {
                 "cameras": cam_manager.list_available_cameras(),
@@ -86,11 +101,11 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
         )
 
     @app.get("/api/config")
-    async def get_config() -> dict[str, Any]:
+    def get_config() -> dict[str, Any]:
         return _ok_envelope(cam_manager.get_config().model_dump())
 
     @app.patch("/api/config", response_model=None)
-    async def patch_config(
+    def patch_config(
         payload: Annotated[dict[str, Any] | None, Body()] = None,
     ) -> dict[str, Any] | JSONResponse:
         try:
@@ -100,7 +115,7 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
             return _err_response(str(exc), status_code=422)
 
     @app.get("/api/telemetry")
-    async def get_telemetry(step: bool = Query(default=False)) -> dict[str, Any]:
+    def get_telemetry(step: bool = Query(default=False)) -> dict[str, Any]:
         if step:
             _, tel = cam_manager.step_frame()
         else:
@@ -108,7 +123,7 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
         return _ok_envelope(tel.model_dump())
 
     @app.post("/api/anomaly", response_model=None)
-    async def post_anomaly(
+    def post_anomaly(
         payload: Annotated[dict[str, Any] | None, Body()] = None,
     ) -> dict[str, Any] | JSONResponse:
         try:
@@ -121,12 +136,12 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
             return _err_response(str(exc), status_code=422)
 
     @app.post("/api/reset")
-    async def post_reset() -> dict[str, Any]:
+    def post_reset() -> dict[str, Any]:
         cam_manager.reset_detectors()
         return _ok_envelope({"status": "recalibrated"})
 
     @app.post("/api/camera/reconnect")
-    async def post_camera_reconnect() -> dict[str, Any]:
+    def post_camera_reconnect() -> dict[str, Any]:
         ok = cam_manager.reconnect_camera()
         cfg = cam_manager.get_config()
         return _ok_envelope(
@@ -138,19 +153,19 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
         )
 
     @app.get("/api/events")
-    async def get_events(
+    def get_events(
         limit: int = Query(default=50, ge=1, le=200),
     ) -> dict[str, Any]:
         items = [ev.model_dump() for ev in cam_manager.get_events(limit=limit)]
         return _ok_envelope({"items": items, "total": len(items), "limit": limit})
 
     @app.delete("/api/events")
-    async def delete_events() -> dict[str, Any]:
+    def delete_events() -> dict[str, Any]:
         cam_manager.clear_events()
         return _ok_envelope({"cleared": True})
 
     @app.get("/api/snapshot")
-    async def get_snapshot() -> Response:
+    def get_snapshot() -> Response:
         jpeg_bytes = cam_manager.get_snapshot_jpeg(quality=90)
         return Response(
             content=jpeg_bytes,
@@ -162,13 +177,13 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
         )
 
     @app.get("/api/stream")
-    async def video_stream(
+    def video_stream(
         max_frames: int | None = Query(default=None, ge=1, le=10000),
     ) -> StreamingResponse:
-        async def frame_generator():
+        def frame_generator() -> Iterator[bytes]:
             sent = 0
-            while True:
-                t0 = asyncio.get_running_loop().time()
+            while not app.state.shutting_down:
+                t0 = time.perf_counter()
                 jpeg_bytes = cam_manager.get_stream_jpeg(quality=80)
                 header = (
                     b"--frame\r\n"
@@ -179,9 +194,8 @@ def create_app(manager: CameraManager | None = None) -> FastAPI:
                 sent += 1
                 if max_frames is not None and sent >= max_frames:
                     break
-                elapsed = asyncio.get_running_loop().time() - t0
-                wait_sec = max(0.002, cam_manager.get_frame_interval_sec() - elapsed)
-                await asyncio.sleep(wait_sec)
+                elapsed = time.perf_counter() - t0
+                time.sleep(max(0.002, cam_manager.get_frame_interval_sec() - elapsed))
 
         return StreamingResponse(
             frame_generator(),

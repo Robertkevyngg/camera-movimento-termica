@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from app.camera_manager import CameraManager
 from app.config import (
     FPS_PRESETS,
+    LITE_MODE_PATCH,
     RESOLUTION_PRESETS,
     EventRecord,
     FrameTelemetry,
@@ -25,6 +26,20 @@ from app.config import (
 )
 from app.industrial_sim import AnomalyType
 from app.thermal_simulator import PALETTE_MAP
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:  # Pillow é opcional; sem ele o vídeo usa o caminho PPM, mais lento.
+    Image = None
+    ImageTk = None
+
+# A leitura humana não acompanha números trocando a cada quadro; atualizar os
+# painéis poucas vezes por segundo libera a interface para o vídeo.
+TELEMETRY_REFRESH_SEC = 0.25
+EVENTS_REFRESH_SEC = 0.5
+EVENTS_VISIBLE_LIMIT = 15
+# Folga mínima entre quadros para o Tk processar cliques e teclas sob carga.
+MIN_IDLE_MS = 5
 
 BG_MAIN = "#0b0f17"
 BG_CARD = "#111827"
@@ -100,7 +115,12 @@ class IndustrialVisionDesktopApp:
         self.is_paused = False
         self._closed = False
         self._after_id: str | None = None
-        self._photo_ref: tk.PhotoImage | None = None
+        self._photo_ref: Any = None
+        self._photo_size: tuple[int, int] | None = None
+        self._video_item_id: int | None = None
+        self._last_telemetry_refresh: float = 0.0
+        self._last_events_refresh: float = 0.0
+        self._telemetry_text_cache: dict[str, str] = {}
         self._last_frame_bgr: np.ndarray | None = None
         self._last_events_sig: tuple[int, ...] | None = None
         self._viewport_rect: tuple[int, int, int, int] = (640, 480, 0, 0)
@@ -255,6 +275,7 @@ class IndustrialVisionDesktopApp:
         _make_btn(quick_bar, "Fusão Térmica + Movimento (3)", lambda: self.set_vision_mode("hybrid"), bg=ACCENT_WARN, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
         _make_btn(quick_bar, "Espelhar Webcam (M)", self.toggle_mirror, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
         _make_btn(quick_bar, "Perfil Corporal (20–42°C)", lambda: self.apply_thermal_profile("human"), bg=ACCENT_BLUE, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
+        _make_btn(quick_bar, "Modo Leve (PC fraco)", self.apply_lite_mode, bg=ACCENT_GREEN, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
 
         self._build_kpi_row(col)
         self._build_events_panel(col)
@@ -533,6 +554,12 @@ class IndustrialVisionDesktopApp:
             f"Perfil térmico aplicado à câmera pessoal: {profile}",
         )
 
+    def apply_lite_mode(self) -> bool:
+        """Aplica o perfil econômico (resolução e FPS reduzidos) para computadores modestos."""
+        return self._apply_patch_safely(
+            LITE_MODE_PATCH, "Modo leve ativado: 320x240 @ 15 FPS, sem trilhas de movimento"
+        )
+
     def apply_resolution_preset(self) -> bool:
         preset = self.res_preset_var.get()
         return self._apply_patch_safely({"resolution_preset": preset}, f"Resolução alterada para {preset}")
@@ -680,12 +707,21 @@ class IndustrialVisionDesktopApp:
         if self._last_frame_bgr is not None and getattr(event, "width", 0) > 1 and getattr(event, "height", 0) > 1:
             self._render_canvas_frame(self._last_frame_bgr, canvas_size=(int(event.width), int(event.height)))
 
-    def step_once(self) -> FrameTelemetry:
-        """Processa um quadro na câmera/simulador e atualiza vídeo, KPIs e eventos."""
+    def step_once(self, *, throttled: bool = False) -> FrameTelemetry:
+        """Processa um quadro na câmera/simulador e atualiza vídeo, KPIs e eventos.
+
+        Com `throttled=True` (laço contínuo) o vídeo é redesenhado a cada quadro,
+        mas KPIs e lista de eventos só nos intervalos de atualização definidos.
+        """
         frame_bgr, tel = self.manager.step_frame()
         self._render_canvas_frame(frame_bgr)
-        self._update_telemetry_widgets(tel)
-        self._refresh_events_listbox(self.manager.get_events(limit=15))
+        now = time.perf_counter()
+        if not throttled or (now - self._last_telemetry_refresh) >= TELEMETRY_REFRESH_SEC:
+            self._last_telemetry_refresh = now
+            self._update_telemetry_widgets(tel)
+        if not throttled or (now - self._last_events_refresh) >= EVENTS_REFRESH_SEC:
+            self._last_events_refresh = now
+            self._refresh_events_listbox(self.manager.get_events(limit=EVENTS_VISIBLE_LIMIT))
         return tel
 
     def _render_canvas_frame(
@@ -698,35 +734,69 @@ class IndustrialVisionDesktopApp:
         src_h, src_w = frame_bgr.shape[:2]
         drawn_w, drawn_h, ox, oy = compute_aspect_fit(src_w, src_h, canvas_w, canvas_h)
         self._viewport_rect = (drawn_w, drawn_h, ox, oy)
-        ppm_bytes, _ = frame_to_ppm_bytes(frame_bgr, max_size=(canvas_w, canvas_h))
-        self._photo_ref = tk.PhotoImage(master=self.root, data=ppm_bytes, format="PPM")
-        self.canvas.delete("video_frame")
-        self.canvas.create_image(ox, oy, anchor=tk.NW, image=self._photo_ref, tags=("video_frame",))
-        if self._drag_rect_id is not None:
-            with contextlib.suppress(tk.TclError):
-                self.canvas.tag_raise(self._drag_rect_id)
+        if ImageTk is not None:
+            self._update_photo_fast(frame_bgr, drawn_w, drawn_h)
+        else:
+            ppm_bytes, _ = frame_to_ppm_bytes(frame_bgr, max_size=(canvas_w, canvas_h))
+            self._photo_ref = tk.PhotoImage(master=self.root, data=ppm_bytes, format="PPM")
+            self._photo_size = None
+        self._place_video_item(ox, oy)
+
+    def _update_photo_fast(self, frame_bgr: np.ndarray, drawn_w: int, drawn_h: int) -> None:
+        """Copia o quadro para a imagem Tk existente (Pillow), sem recriá-la a cada quadro."""
+        src_h, src_w = frame_bgr.shape[:2]
+        target = frame_bgr
+        if (drawn_w, drawn_h) != (src_w, src_h):
+            interp = cv2.INTER_AREA if drawn_w < src_w else cv2.INTER_LINEAR
+            target = cv2.resize(frame_bgr, (drawn_w, drawn_h), interpolation=interp)
+        pil_image = Image.fromarray(cv2.cvtColor(target, cv2.COLOR_BGR2RGB))
+        if self._photo_ref is not None and self._photo_size == (drawn_w, drawn_h):
+            self._photo_ref.paste(pil_image)
+            return
+        self._photo_ref = ImageTk.PhotoImage(pil_image, master=self.root)
+        self._photo_size = (drawn_w, drawn_h)
+
+    def _place_video_item(self, offset_x: int, offset_y: int) -> None:
+        """Mantém um único item de imagem no canvas, só trocando imagem e posição."""
+        if self._video_item_id is None:
+            self._video_item_id = self.canvas.create_image(
+                offset_x, offset_y, anchor=tk.NW, image=self._photo_ref, tags=("video_frame",)
+            )
+            self.canvas.tag_lower(self._video_item_id)
+            return
+        self.canvas.itemconfigure(self._video_item_id, image=self._photo_ref)
+        self.canvas.coords(self._video_item_id, offset_x, offset_y)
+
+    def _set_text(self, name: str, var: tk.StringVar, text: str) -> None:
+        """Atualiza um rótulo de telemetria apenas quando o texto realmente mudou."""
+        if self._telemetry_text_cache.get(name) != text:
+            self._telemetry_text_cache[name] = text
+            var.set(text)
 
     def _update_telemetry_widgets(self, tel: FrameTelemetry) -> None:
-        self.stream_meta_var.set(f"{tel.width}x{tel.height} @ {tel.actual_fps:.1f} FPS")
-        self.kpi_fps_var.set(f"{tel.actual_fps:.1f} / {tel.target_fps} FPS")
-        self.kpi_latency_var.set(f"Processamento: {tel.processing_ms:.1f} ms")
-        self.kpi_motion_var.set(f"{tel.motion_percentage:.1f}%")
-        self.kpi_objects_var.set(f"{tel.object_count} objeto(s) em movimento")
-        self.kpi_temp_max_var.set(f"{tel.max_temp_c:.1f} °C")
-        self.kpi_temp_range_var.set(f"Mín: {tel.min_temp_c:.1f}°C | Méd: {tel.avg_temp_c:.1f}°C")
-        self.kpi_resolution_var.set(f"{tel.width} x {tel.height}")
-        self.kpi_coords_var.set(f"Hotspot: ({tel.hotspot_x}, {tel.hotspot_y})")
+        self._set_text("meta", self.stream_meta_var, f"{tel.width}x{tel.height} @ {tel.actual_fps:.1f} FPS")
+        self._set_text("fps", self.kpi_fps_var, f"{tel.actual_fps:.1f} / {tel.target_fps} FPS")
+        self._set_text("latency", self.kpi_latency_var, f"Processamento: {tel.processing_ms:.1f} ms")
+        self._set_text("motion", self.kpi_motion_var, f"{tel.motion_percentage:.1f}%")
+        self._set_text("objects", self.kpi_objects_var, f"{tel.object_count} objeto(s) em movimento")
+        self._set_text("temp_max", self.kpi_temp_max_var, f"{tel.max_temp_c:.1f} °C")
+        self._set_text("temp_range", self.kpi_temp_range_var, f"Mín: {tel.min_temp_c:.1f}°C | Méd: {tel.avg_temp_c:.1f}°C")
+        self._set_text("resolution", self.kpi_resolution_var, f"{tel.width} x {tel.height}")
+        self._set_text("coords", self.kpi_coords_var, f"Hotspot: ({tel.hotspot_x}, {tel.hotspot_y})")
 
         if tel.hardware_fallback:
-            self.badge_source_var.set("FONTE: FALLBACK (SEM CÂMERA)")
+            source_text = "FONTE: FALLBACK (SEM CÂMERA)"
         elif tel.source_active == "camera":
-            self.badge_source_var.set(f"FONTE: CÂMERA PESSOAL (#{self.manager.get_config().camera_index})")
+            source_text = f"FONTE: CÂMERA PESSOAL (#{self.manager.get_config().camera_index})"
         else:
-            self.badge_source_var.set("FONTE: MODO TESTE")
+            source_text = "FONTE: MODO TESTE"
+        self._set_text("source", self.badge_source_var, source_text)
 
-        self.badge_alert_var.set(f"STATUS: {tel.alert_level}")
-        alert_color = ACCENT_CRIT if tel.alert_level == "CRITICO" else ACCENT_WARN if tel.alert_level == "ATENCAO" else ACCENT_GREEN
-        self.lbl_badge_alert.configure(bg=alert_color)
+        alert_text = f"STATUS: {tel.alert_level}"
+        if self._telemetry_text_cache.get("alert") != alert_text:
+            self._set_text("alert", self.badge_alert_var, alert_text)
+            alert_color = ACCENT_CRIT if tel.alert_level == "CRITICO" else ACCENT_WARN if tel.alert_level == "ATENCAO" else ACCENT_GREEN
+            self.lbl_badge_alert.configure(bg=alert_color)
 
     def _refresh_events_listbox(self, events: list[EventRecord]) -> None:
         sig = tuple(ev.id for ev in events)
@@ -782,13 +852,13 @@ def run_native_app(
             return
         t0 = time.perf_counter()
         if not app.is_paused:
-            app.step_once()
+            app.step_once(throttled=True)
             frames_processed += 1
             if max_frames is not None and frames_processed >= max_frames:
                 app.close()
                 return
         elapsed = time.perf_counter() - t0
-        delay_ms = max(1, round((app.manager.get_frame_interval_sec() - elapsed) * 1000))
+        delay_ms = max(MIN_IDLE_MS, round((app.manager.get_frame_interval_sec() - elapsed) * 1000))
         app._after_id = app.root.after(delay_ms, _tick)
 
     app._after_id = app.root.after(10, _tick)

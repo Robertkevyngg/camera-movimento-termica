@@ -14,6 +14,13 @@ from typing import Any, Literal
 import cv2
 import numpy as np
 
+from app.camera_capture import (
+    DEFAULT_RETRY_INTERVAL_SEC,
+    BackgroundCapture,
+    apply_capture_format,
+    open_camera_device,
+    release_capture,
+)
 from app.config import (
     AlertLevel,
     CameraSource,
@@ -28,6 +35,14 @@ from app.thermal_simulator import ThermalResult, ThermalSimulator
 
 MAX_EVENT_LOGS = 200
 FPS_WINDOW_SIZE = 30
+SYNC_RETRY_INTERVAL_SEC = 0.5
+# Tolerância para a câmera entregar o primeiro quadro após (re)abrir. Nesse
+# intervalo a interface mostra um quadro de espera em vez de travar; passado o
+# prazo, assume-se câmera indisponível e entra o simulador de fallback.
+CAMERA_OPEN_WAIT_SEC = 2.0
+CONNECTING_FRAME_COLOR = (26, 20, 16)
+CONNECTING_TEXT_COLOR = (235, 225, 210)
+THERMAL_IMAGE_MODES = ("thermal", "hybrid")
 
 
 class CameraManager:
@@ -38,23 +53,42 @@ class CameraManager:
         initial_config: SystemConfig | None = None,
         capture_factory: Callable[[int], Any] | None = None,
         camera_retry_interval_sec: float | None = None,
+        background_capture: bool | None = None,
     ) -> None:
+        """Cria o controlador.
+
+        `capture_factory` substitui a abertura da câmera (testes). Com a câmera
+        real a captura roda em thread dedicada; `background_capture` força ou
+        desativa esse modo independentemente da fábrica usada.
+        """
         self._lock = RLock()
         self._config: SystemConfig = initial_config or SystemConfig()
-        self._capture_factory: Callable[[int], Any] = capture_factory or cv2.VideoCapture
+        self._capture_factory: Callable[[int], Any] | None = capture_factory
+        self._use_background_capture: bool = (
+            background_capture if background_capture is not None else capture_factory is None
+        )
+        default_retry = (
+            DEFAULT_RETRY_INTERVAL_SEC
+            if self._use_background_capture
+            else (SYNC_RETRY_INTERVAL_SEC if capture_factory is None else 0.0)
+        )
         self._camera_retry_interval_sec: float = (
-            camera_retry_interval_sec
-            if camera_retry_interval_sec is not None
-            else (0.5 if capture_factory is None else 0.0)
+            camera_retry_interval_sec if camera_retry_interval_sec is not None else default_retry
         )
         self._last_camera_fail_ts: float = 0.0
         self._cap: Any = None
         self._opened_camera_index: int | None = None
         self._applied_hw_props: tuple[int, int, int] | None = None
-        self._last_raw_cam_frame: np.ndarray | None = None
-        self._last_raw_cam_ts: float = 0.0
+        self._bg_capture: BackgroundCapture | None = None
+        self._bg_format: tuple[int, int, int] | None = None
+        self._bg_started_ts: float = 0.0
+        self._lingering_capture_thread: Any = None
+        self._camera_connecting: bool = False
+        self._connecting_frame: np.ndarray | None = None
+        self._cam_cache_key: tuple[int, bool] | None = None
+        self._cam_cache_seq: int | None = None
+        self._cam_cache_frame: np.ndarray | None = None
         self._last_cam_frame_is_new: bool = True
-        self._unconsumed_cam_frame: bool = False
 
         self._simulator = IndustrialSceneSimulator()
         self._motion_detector = MotionDetector()
@@ -200,6 +234,7 @@ class CameraManager:
                 heat_hint=heat_hint,
                 roi=cfg.roi,
                 is_new_frame=is_new_frame,
+                render_image=cfg.vision_mode in THERMAL_IMAGE_MODES,
             )
 
             actual_fps = self._update_fps_counter(time.perf_counter())
@@ -353,10 +388,11 @@ class CameraManager:
             self._invalidate_cache()
             if self._config.source != "camera":
                 self._config = self._config.apply_patch({"source": "camera"})
-            frame = self._read_physical_camera(self._config)
+            frame = self._read_physical_camera(self._config, wait_for_open=True)
             ok = frame is not None
-            if ok:
-                self._unconsumed_cam_frame = True
+            # O quadro lido aqui não foi analisado: o próximo passo deve tratá-lo como novo.
+            self._cam_cache_key = None
+            self._cam_cache_seq = None
             self._record_event(
                 category="SYSTEM",
                 severity="NORMAL" if ok else "ATENCAO",
@@ -379,6 +415,11 @@ class CameraManager:
         if cfg.source == "camera":
             cam_frame = self._read_physical_camera(cfg)
             if cam_frame is not None:
+                if self._camera_connecting:
+                    # Primeiro quadro real após a tela de espera: recalibra o fundo.
+                    self._camera_connecting = False
+                    self._motion_detector.reset()
+                    self._thermal_simulator.reset()
                 if self._prev_fallback_warned:
                     self._prev_fallback_warned = False
                     self._motion_detector.reset()
@@ -390,17 +431,19 @@ class CameraManager:
                     )
 
                 if self._simulator.get_active_anomalies():
-                    heat_overlay = self._thermal_simulator.compute_luminance_heat(
-                        cam_frame, cfg.thermal
-                    )
-                    self._simulator.step_anomalies(
-                        cam_frame, heat_overlay, self._frame_index * 0.08
-                    )
-                    return cam_frame, heat_overlay, "camera", False, True
+                    return self._overlay_anomalies(cam_frame, cfg)
                 return cam_frame, None, "camera", False, self._last_cam_frame_is_new
+
+            if self._is_camera_connecting():
+                self._camera_connecting = True
+                waiting_frame = self._get_connecting_frame(cfg)
+                if self._simulator.get_active_anomalies():
+                    return self._overlay_anomalies(waiting_frame, cfg)
+                return waiting_frame, None, "camera", False, True
 
             if not self._prev_fallback_warned:
                 self._prev_fallback_warned = True
+                self._camera_connecting = False
                 self._motion_detector.reset()
                 self._thermal_simulator.reset()
                 self._record_event(
@@ -421,31 +464,110 @@ class CameraManager:
         )
         return sim_frame, sim_heat, "simulator", False, True
 
-    def _open_hardware_capture(self, camera_index: int) -> Any:
-        if self._capture_factory is cv2.VideoCapture and hasattr(cv2, "CAP_V4L2"):
-            with contextlib.suppress(cv2.error, OSError, RuntimeError, TypeError):
-                cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-                if cap is not None and cap.isOpened():
-                    with contextlib.suppress(cv2.error, OSError, RuntimeError):
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2.0)
-                        cap.set(
-                            cv2.CAP_PROP_FOURCC,
-                            float(cv2.VideoWriter_fourcc(*"MJPG")),
-                        )
-                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280.0)
-                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720.0)
-                        cap.set(cv2.CAP_PROP_FPS, 30.0)
-                    return cap
-                if cap is not None:
-                    with contextlib.suppress(cv2.error, OSError, RuntimeError):
-                        cap.release()
-                    return None
-        with contextlib.suppress(cv2.error, OSError, RuntimeError, TypeError):
-            return self._capture_factory(camera_index)
-        return None
+    def _open_camera(self, camera_index: int, width: int, height: int, fps: int) -> Any:
+        """Abre a câmera real ou, se houver, a fábrica injetada, já no formato pedido."""
+        if self._capture_factory is None:
+            return open_camera_device(camera_index, width, height, fps)
+        cap = self._capture_factory(camera_index)
+        if cap is not None and cap.isOpened():
+            apply_capture_format(cap, width, height, fps)
+        return cap
 
-    def _read_physical_camera(self, cfg: SystemConfig) -> np.ndarray | None:
-        is_real_v4l2 = self._capture_factory is cv2.VideoCapture
+    def _overlay_anomalies(
+        self, frame: np.ndarray, cfg: SystemConfig
+    ) -> tuple[np.ndarray, np.ndarray | None, CameraSource, bool, bool]:
+        """Desenha as anomalias ativas sobre uma cópia do quadro da câmera."""
+        # Copia para não sujar o quadro em cache, que é reutilizado entre passos.
+        painted = frame.copy()
+        heat_overlay = self._thermal_simulator.compute_luminance_heat(painted, cfg.thermal)
+        self._simulator.step_anomalies(painted, heat_overlay, self._frame_index * 0.08)
+        return painted, heat_overlay, "camera", False, True
+
+    def _is_camera_connecting(self) -> bool:
+        """True enquanto a thread de captura ainda está no prazo para entregar o 1º quadro."""
+        return (
+            self._bg_capture is not None
+            and not self._prev_fallback_warned
+            and not self._bg_capture.has_delivered_frame
+            and (time.perf_counter() - self._bg_started_ts) < CAMERA_OPEN_WAIT_SEC
+        )
+
+    def _get_connecting_frame(self, cfg: SystemConfig) -> np.ndarray:
+        """Quadro de espera exibido enquanto a câmera abre (em cache por resolução)."""
+        cached = self._connecting_frame
+        if cached is None or cached.shape[:2] != (cfg.height, cfg.width):
+            cached = np.full((cfg.height, cfg.width, 3), CONNECTING_FRAME_COLOR, dtype=np.uint8)
+            scale = max(0.4, cfg.width / 900.0)
+            cv2.putText(
+                cached,
+                f"Conectando a camera #{cfg.camera_index}...",
+                (max(8, cfg.width // 14), cfg.height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scale,
+                CONNECTING_TEXT_COLOR,
+                max(1, round(scale * 2)),
+                cv2.LINE_AA,
+            )
+            self._connecting_frame = cached
+        return cached
+
+    def _read_physical_camera(
+        self, cfg: SystemConfig, *, wait_for_open: bool = False
+    ) -> np.ndarray | None:
+        """Devolve o quadro atual da câmera já na resolução/espelhamento da config.
+
+        `wait_for_open` bloqueia até o primeiro quadro (reconexão pedida pelo
+        usuário, que espera um resultado); o laço de vídeo nunca bloqueia.
+        """
+        if self._use_background_capture:
+            return self._read_background_camera(cfg, wait_for_open=wait_for_open)
+        frame = self._read_sync_camera(cfg)
+        if frame is None:
+            return None
+        self._last_cam_frame_is_new = True
+        return self._fit_camera_frame(frame, cfg)
+
+    def _read_background_camera(
+        self, cfg: SystemConfig, *, wait_for_open: bool = False
+    ) -> np.ndarray | None:
+        """Consulta, sem bloquear, o quadro mais recente da thread de captura."""
+        hw_format = (cfg.camera_index, cfg.width, cfg.height)
+        if self._bg_capture is None or self._bg_format != hw_format:
+            self._release_camera()
+            self._bg_capture = BackgroundCapture(
+                self._open_camera,
+                cfg.camera_index,
+                cfg.width,
+                cfg.height,
+                retry_interval_sec=self._camera_retry_interval_sec,
+                predecessor=self._lingering_capture_thread,
+            )
+            self._bg_format = hw_format
+            self._bg_capture.start()
+            self._bg_started_ts = time.perf_counter()
+            self._frame_timestamps.clear()
+        if wait_for_open and not self._bg_capture.has_delivered_frame:
+            self._bg_capture.wait_for_frame(CAMERA_OPEN_WAIT_SEC)
+
+        raw_frame, sequence = self._bg_capture.read_latest()
+        if raw_frame is None:
+            self._cam_cache_key = None
+            self._cam_cache_frame = None
+            return None
+
+        cache_key = (sequence, cfg.mirror)
+        if self._cam_cache_key == cache_key and self._cam_cache_frame is not None:
+            self._last_cam_frame_is_new = False
+            return self._cam_cache_frame
+
+        self._last_cam_frame_is_new = sequence != self._cam_cache_seq
+        self._cam_cache_key = cache_key
+        self._cam_cache_seq = sequence
+        self._cam_cache_frame = self._fit_camera_frame(raw_frame, cfg)
+        return self._cam_cache_frame
+
+    def _read_sync_camera(self, cfg: SystemConfig) -> np.ndarray | None:
+        """Leitura direta na thread chamadora (fábricas injetadas e modo sem thread)."""
         try:
             if self._cap is None or self._opened_camera_index != cfg.camera_index:
                 now = time.perf_counter()
@@ -455,50 +577,37 @@ class CameraManager:
                 ):
                     return None
                 self._release_camera()
-                self._cap = self._open_hardware_capture(cfg.camera_index)
+                self._cap = self._open_camera(
+                    cfg.camera_index, cfg.width, cfg.height, cfg.target_fps
+                )
                 self._opened_camera_index = cfg.camera_index
-                self._applied_hw_props = None
+                self._applied_hw_props = (cfg.width, cfg.height, cfg.target_fps)
                 self._frame_timestamps.clear()
 
             if self._cap is None or not self._cap.isOpened():
-                self._release_camera()
-                self._last_camera_fail_ts = time.perf_counter()
-                return None
+                return self._mark_camera_failure()
 
-            if not is_real_v4l2:
-                desired_props = (cfg.width, cfg.height, cfg.target_fps)
-                if self._applied_hw_props != desired_props:
-                    self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(desired_props[0]))
-                    self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(desired_props[1]))
-                    self._cap.set(cv2.CAP_PROP_FPS, float(desired_props[2]))
-                    self._applied_hw_props = desired_props
+            desired_props = (cfg.width, cfg.height, cfg.target_fps)
+            if self._applied_hw_props != desired_props:
+                apply_capture_format(self._cap, *desired_props)
+                self._applied_hw_props = desired_props
 
-            now_read = time.perf_counter()
-            if (
-                is_real_v4l2
-                and self._last_raw_cam_frame is not None
-                and (now_read - self._last_raw_cam_ts) < 0.028
-            ):
-                frame = self._last_raw_cam_frame.copy()
-                self._last_cam_frame_is_new = self._unconsumed_cam_frame
-                self._unconsumed_cam_frame = False
-            else:
-                ret, frame = self._cap.read()
-                if not ret or frame is None or frame.size == 0:
-                    self._release_camera()
-                    self._last_camera_fail_ts = time.perf_counter()
-                    return None
-                self._last_cam_frame_is_new = True
-                self._unconsumed_cam_frame = False
-                if is_real_v4l2:
-                    self._last_raw_cam_frame = frame.copy()
-                    self._last_raw_cam_ts = time.perf_counter()
-        except (cv2.error, OSError, RuntimeError):
-            self._release_camera()
-            self._last_camera_fail_ts = time.perf_counter()
-            return None
+            ret, frame = self._cap.read()
+            if not ret or frame is None or frame.size == 0:
+                return self._mark_camera_failure()
+        except (cv2.error, OSError, RuntimeError, TypeError):
+            return self._mark_camera_failure()
 
         self._last_camera_fail_ts = 0.0
+        return frame
+
+    def _mark_camera_failure(self) -> None:
+        self._release_camera()
+        self._last_camera_fail_ts = time.perf_counter()
+
+    @staticmethod
+    def _fit_camera_frame(frame: np.ndarray, cfg: SystemConfig) -> np.ndarray:
+        """Ajusta o quadro bruto à resolução configurada e ao espelhamento."""
         if frame.shape[:2] != (cfg.height, cfg.width):
             frame = cv2.resize(
                 frame, (cfg.width, cfg.height), interpolation=cv2.INTER_LINEAR
@@ -508,16 +617,19 @@ class CameraManager:
         return frame
 
     def _release_camera(self) -> None:
+        if self._bg_capture is not None:
+            self._lingering_capture_thread = self._bg_capture.stop()
+            self._bg_capture = None
+            self._bg_format = None
         if self._cap is not None:
-            with contextlib.suppress(cv2.error, OSError, RuntimeError):
-                self._cap.release()
+            release_capture(self._cap)
             self._cap = None
             self._opened_camera_index = None
             self._applied_hw_props = None
-            self._last_raw_cam_frame = None
-            self._last_raw_cam_ts = 0.0
-            self._last_cam_frame_is_new = True
-            self._unconsumed_cam_frame = False
+        self._cam_cache_key = None
+        self._cam_cache_seq = None
+        self._cam_cache_frame = None
+        self._last_cam_frame_is_new = True
 
     def _update_fps_counter(self, now: float) -> float:
         if self._frame_timestamps and (now - self._frame_timestamps[-1]) > 2.0:

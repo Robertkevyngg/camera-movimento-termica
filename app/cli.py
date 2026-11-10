@@ -15,7 +15,7 @@ import uvicorn
 
 from app.api import create_app
 from app.camera_manager import CameraManager
-from app.config import RESOLUTION_PRESETS, SystemConfig
+from app.config import LITE_MODE_PATCH, RESOLUTION_PRESETS, SystemConfig
 from app.desktop_app import run_native_app
 from app.thermal_simulator import PALETTE_MAP
 
@@ -97,6 +97,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Abre o aplicativo Desktop local completo (interface nativa SCADA Tkinter)",
     )
     parser.add_argument(
+        "--lite",
+        action="store_true",
+        help="Modo leve para computadores modestos (320x240 @ 15 FPS, sem trilhas)",
+    )
+    parser.add_argument(
         "--max-frames",
         type=int,
         default=0,
@@ -108,7 +113,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def build_initial_config(args: argparse.Namespace) -> SystemConfig:
     """Constrói um SystemConfig imutável a partir dos argumentos CLI."""
     width, height = RESOLUTION_PRESETS[args.resolution]
-    return SystemConfig(
+    base = SystemConfig(
         source=args.source,
         camera_index=args.camera_index,
         mirror=not getattr(args, "no_mirror", False),
@@ -119,6 +124,7 @@ def build_initial_config(args: argparse.Namespace) -> SystemConfig:
         thermal={"palette": args.palette},
         simulator={"scenario": args.scenario},
     )
+    return base.apply_patch(LITE_MODE_PATCH) if getattr(args, "lite", False) else base
 
 
 def run_benchmark(
