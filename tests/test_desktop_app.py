@@ -262,7 +262,7 @@ def test_cli_app_flag_and_desktop_launcher_entrypoint(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "run_native_app",
-        lambda config, max_frames=None: called.__setitem__("native", called["native"] + 1) or 0,
+        lambda config, max_frames=None, **_kw: called.__setitem__("native", called["native"] + 1) or 0,
     )
     monkeypatch.setattr(
         cli_mod,

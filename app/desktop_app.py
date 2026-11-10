@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import time
 import tkinter as tk
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk
@@ -16,16 +17,30 @@ from pydantic import ValidationError
 
 from app.camera_manager import CameraManager
 from app.config import (
-    FPS_PRESETS,
     LITE_MODE_PATCH,
     RESOLUTION_PRESETS,
     EventRecord,
     FrameTelemetry,
-    ROIConfig,
     SystemConfig,
 )
+from app.desktop_tabs import build_camera_tab, build_motion_tab, build_thermal_tab
+from app.desktop_widgets import (
+    ACCENT_BLUE,
+    ACCENT_CRIT,
+    ACCENT_GREEN,
+    ACCENT_WARN,
+    BG_CARD,
+    BG_INPUT,
+    BG_MAIN,
+    FG_MUTED,
+    FG_PRIMARY,
+    canvas_rect_to_roi,
+    compute_aspect_fit,
+    frame_to_ppm_bytes,
+    make_btn,
+)
+from app.frame_pump import FramePump
 from app.industrial_sim import AnomalyType
-from app.thermal_simulator import PALETTE_MAP
 
 try:
     from PIL import Image, ImageTk
@@ -40,71 +55,7 @@ EVENTS_REFRESH_SEC = 0.5
 EVENTS_VISIBLE_LIMIT = 15
 # Folga mínima entre quadros para o Tk processar cliques e teclas sob carga.
 MIN_IDLE_MS = 5
-
-BG_MAIN = "#0b0f17"
-BG_CARD = "#111827"
-BG_INPUT = "#1f2937"
-FG_PRIMARY = "#f8fafc"
-FG_MUTED = "#94a3b8"
-ACCENT_BLUE = "#0284c7"
-ACCENT_GREEN = "#059669"
-ACCENT_WARN = "#d97706"
-ACCENT_CRIT = "#dc2626"
-
-
-def compute_aspect_fit(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int, int, int]:
-    """Calcula dimensões e deslocamento (w, h, ox, oy) preservando a proporção."""
-    safe_src_w, safe_src_h = max(1, int(src_w)), max(1, int(src_h))
-    safe_max_w, safe_max_h = max(64, int(max_w)), max(64, int(max_h))
-    scale = min(safe_max_w / safe_src_w, safe_max_h / safe_src_h)
-    drawn_w, drawn_h = max(1, round(safe_src_w * scale)), max(1, round(safe_src_h * scale))
-    return drawn_w, drawn_h, max(0, (safe_max_w - drawn_w) // 2), max(0, (safe_max_h - drawn_h) // 2)
-
-
-def frame_to_ppm_bytes(
-    frame_bgr: np.ndarray, max_size: tuple[int, int] | None = None
-) -> tuple[bytes, tuple[int, int]]:
-    """Converte um quadro BGR OpenCV para bytes PPM (P6) compatíveis com tk.PhotoImage."""
-    if frame_bgr is None or frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3 or frame_bgr.size == 0:
-        raise ValueError("Quadro inválido para conversão PPM")
-    src_h, src_w = frame_bgr.shape[:2]
-    target_bgr = frame_bgr
-    if max_size is not None:
-        drawn_w, drawn_h, _, _ = compute_aspect_fit(src_w, src_h, max_size[0], max_size[1])
-        if (drawn_w, drawn_h) != (src_w, src_h):
-            interp = cv2.INTER_AREA if drawn_w < src_w else cv2.INTER_LINEAR
-            target_bgr = cv2.resize(frame_bgr, (drawn_w, drawn_h), interpolation=interp)
-    out_h, out_w = target_bgr.shape[:2]
-    rgb = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2RGB)
-    return f"P6 {out_w} {out_h} 255\n".encode("ascii") + rgb.tobytes(), (out_w, out_h)
-
-
-def canvas_rect_to_roi(
-    x0: float, y0: float, x1: float, y1: float, offset_x: int, offset_y: int, drawn_w: int, drawn_h: int
-) -> ROIConfig | None:
-    """Converte um retângulo arrastado no canvas em uma ROIConfig normalizada."""
-    if drawn_w <= 0 or drawn_h <= 0 or abs(x1 - x0) < 12 or abs(y1 - y0) < 12:
-        return None
-    left, right = max(0.0, min(float(drawn_w), min(x0, x1) - offset_x)), max(0.0, min(float(drawn_w), max(x0, x1) - offset_x))
-    top, bottom = max(0.0, min(float(drawn_h), min(y0, y1) - offset_y)), max(0.0, min(float(drawn_h), max(y0, y1) - offset_y))
-    if (right - left) < 12.0 or (bottom - top) < 12.0:
-        return None
-    norm_w, norm_h = round(max(0.05, min(1.0, (right - left) / drawn_w)), 3), round(max(0.05, min(1.0, (bottom - top) / drawn_h)), 3)
-    norm_x, norm_y = round(min(0.949, min(1.0 - norm_w, max(0.0, left / drawn_w))), 3), round(min(0.949, min(1.0 - norm_h, max(0.0, top / drawn_h))), 3)
-    return ROIConfig(enabled=True, x=norm_x, y=norm_y, w=norm_w, h=norm_h)
-
-
-def _make_btn(parent: tk.Widget, text: str, command: Any, bg: str = BG_INPUT, **kwargs: Any) -> tk.Button:
-    """Cria um botão estilizado no padrão SCADA."""
-    return tk.Button(parent, text=text, command=command, bg=bg, fg=FG_PRIMARY, activebackground=ACCENT_BLUE, activeforeground=FG_PRIMARY, relief=tk.FLAT, **kwargs)
-
-
-def _make_entry(parent: tk.Widget, var: tk.Variable, width: int, on_enter: Any) -> tk.Entry:
-    """Cria um campo de entrada estilizado que aplica alterações ao pressionar Enter."""
-    entry = tk.Entry(parent, textvariable=var, width=width, bg=BG_INPUT, fg=FG_PRIMARY)
-    entry.bind("<Return>", lambda _e: on_enter())
-    return entry
-
+MAX_POLL_MS = 33
 
 class IndustrialVisionDesktopApp:
     """Aplicação Desktop Local nativa para captura da câmera pessoal, movimento e simulação térmica."""
@@ -121,6 +72,7 @@ class IndustrialVisionDesktopApp:
         self._last_telemetry_refresh: float = 0.0
         self._last_events_refresh: float = 0.0
         self._telemetry_text_cache: dict[str, str] = {}
+        self._frame_pump: FramePump | None = None
         self._last_frame_bgr: np.ndarray | None = None
         self._last_events_sig: tuple[int, ...] | None = None
         self._viewport_rect: tuple[int, int, int, int] = (640, 480, 0, 0)
@@ -232,8 +184,8 @@ class IndustrialVisionDesktopApp:
         self.lbl_badge_alert = tk.Label(actions, textvariable=self.badge_alert_var, bg=ACCENT_GREEN, fg=FG_PRIMARY, padx=10, pady=5, font=("DejaVu Sans", 9, "bold"))
         self.lbl_badge_alert.pack(side=tk.LEFT, padx=4)
         tk.Button(actions, textvariable=self.pause_btn_var, command=self.toggle_pause, bg=BG_INPUT, fg=FG_PRIMARY, relief=tk.FLAT, padx=10, pady=5).pack(side=tk.LEFT, padx=4)
-        _make_btn(actions, "Recalibrar Fundo", self.recalibrate, padx=10, pady=5).pack(side=tk.LEFT, padx=4)
-        _make_btn(actions, "Salvar Foto JPEG", self.save_snapshot, bg=ACCENT_BLUE, padx=12, pady=5, font=("DejaVu Sans", 9, "bold")).pack(side=tk.LEFT, padx=4)
+        make_btn(actions, "Recalibrar Fundo", self.recalibrate, padx=10, pady=5).pack(side=tk.LEFT, padx=4)
+        make_btn(actions, "Salvar Foto JPEG", self.save_snapshot, bg=ACCENT_BLUE, padx=12, pady=5, font=("DejaVu Sans", 9, "bold")).pack(side=tk.LEFT, padx=4)
 
     def _build_viewport_column(self, parent: tk.Frame) -> None:
         col = tk.Frame(parent, bg=BG_MAIN)
@@ -256,7 +208,7 @@ class IndustrialVisionDesktopApp:
             ("hybrid", "3. Fusão (Câmera + Térmica)"),
             ("motion_mask", "4. Rastreador de Movimento"),
         ]:
-            btn = _make_btn(mode_bar, label, lambda m=key: self.set_vision_mode(m), padx=10, pady=4, font=("DejaVu Sans", 9, "bold"))
+            btn = make_btn(mode_bar, label, lambda m=key: self.set_vision_mode(m), padx=10, pady=4, font=("DejaVu Sans", 9, "bold"))
             btn.pack(side=tk.LEFT, padx=(0, 4))
             self.mode_buttons[key] = btn
         tk.Label(mode_bar, textvariable=self.stream_meta_var, bg=BG_CARD, fg="#38bdf8", font=("DejaVu Sans Mono", 9, "bold")).pack(side=tk.RIGHT)
@@ -271,11 +223,11 @@ class IndustrialVisionDesktopApp:
         quick_bar = tk.Frame(video_card, bg=BG_CARD, pady=4)
         quick_bar.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         tk.Label(quick_bar, text="Ações da Câmera Pessoal:", bg=BG_CARD, fg=FG_MUTED, font=("DejaVu Sans", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
-        _make_btn(quick_bar, "Simular Câmera Térmica (2)", lambda: self.set_vision_mode("thermal"), bg=ACCENT_CRIT, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
-        _make_btn(quick_bar, "Fusão Térmica + Movimento (3)", lambda: self.set_vision_mode("hybrid"), bg=ACCENT_WARN, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
-        _make_btn(quick_bar, "Espelhar Webcam (M)", self.toggle_mirror, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
-        _make_btn(quick_bar, "Perfil Corporal (20–42°C)", lambda: self.apply_thermal_profile("human"), bg=ACCENT_BLUE, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
-        _make_btn(quick_bar, "Modo Leve (PC fraco)", self.apply_lite_mode, bg=ACCENT_GREEN, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
+        make_btn(quick_bar, "Simular Câmera Térmica (2)", lambda: self.set_vision_mode("thermal"), bg=ACCENT_CRIT, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
+        make_btn(quick_bar, "Fusão Térmica + Movimento (3)", lambda: self.set_vision_mode("hybrid"), bg=ACCENT_WARN, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
+        make_btn(quick_bar, "Espelhar Webcam (M)", self.toggle_mirror, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
+        make_btn(quick_bar, "Perfil Corporal (20–42°C)", lambda: self.apply_thermal_profile("human"), bg=ACCENT_BLUE, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
+        make_btn(quick_bar, "Modo Leve (PC fraco)", self.apply_lite_mode, bg=ACCENT_GREEN, padx=8, pady=3).pack(side=tk.LEFT, padx=3)
 
         self._build_kpi_row(col)
         self._build_events_panel(col)
@@ -305,7 +257,7 @@ class IndustrialVisionDesktopApp:
         hdr = tk.Frame(ev_card, bg=BG_CARD)
         hdr.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         tk.Label(hdr, text="Registro de Movimentos Capturados e Alertas Térmicos", bg=BG_CARD, fg=FG_PRIMARY, font=("DejaVu Sans", 10, "bold")).pack(side=tk.LEFT)
-        _make_btn(hdr, "Limpar Histórico", self.clear_events, padx=8, pady=2, font=("DejaVu Sans", 8)).pack(side=tk.RIGHT)
+        make_btn(hdr, "Limpar Histórico", self.clear_events, padx=8, pady=2, font=("DejaVu Sans", 8)).pack(side=tk.RIGHT)
         self.events_listbox = tk.Listbox(
             ev_card, bg="#090d14", fg=FG_PRIMARY, selectbackground=ACCENT_BLUE, highlightthickness=0, borderwidth=0, font=("DejaVu Sans Mono", 9), height=6
         )
@@ -322,130 +274,9 @@ class IndustrialVisionDesktopApp:
         notebook.add(tab_cam, text="1. Câmera Pessoal & FPS")
         notebook.add(tab_thermal, text="2. Simulador Térmico")
         notebook.add(tab_motion, text="3. Movimento & ROI")
-        self._build_camera_tab(tab_cam)
-        self._build_thermal_tab(tab_thermal)
-        self._build_motion_tab(tab_motion)
-
-    def _build_camera_tab(self, parent: tk.Frame) -> None:
-        tk.Label(parent, text="Câmera Pessoal, Resolução & FPS", bg=BG_CARD, fg=FG_PRIMARY, font=("DejaVu Sans", 11, "bold")).pack(anchor="w", pady=(0, 6))
-        tk.Label(parent, text="Câmera Pessoal Ativa:", bg=BG_CARD, fg=FG_MUTED).pack(anchor="w")
-        tk.Label(parent, textvariable=self.camera_device_var, bg=BG_INPUT, fg="#38bdf8", padx=8, pady=5, font=("DejaVu Sans Mono", 9, "bold")).pack(fill=tk.X, pady=(2, 8))
-
-        cam_row = tk.Frame(parent, bg=BG_CARD)
-        cam_row.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(cam_row, text="Índice (/dev/videoN):", bg=BG_CARD, fg=FG_MUTED).pack(side=tk.LEFT)
-        _make_entry(cam_row, self.camera_index_var, 5, self.apply_source_and_scenario).pack(side=tk.LEFT, padx=6)
-        _make_btn(cam_row, "Trocar", self.apply_source_and_scenario, padx=8).pack(side=tk.LEFT, padx=(0, 4))
-        _make_btn(cam_row, "Reconectar Webcam", self.reconnect_camera, bg=ACCENT_GREEN, padx=8).pack(side=tk.LEFT)
-
-        tk.Checkbutton(
-            parent, text="Espelhar Câmera Pessoal (Modo Webcam)", variable=self.mirror_var, command=self.apply_mirror_setting, bg=BG_CARD, fg=FG_PRIMARY, selectcolor=BG_INPUT, activebackground=BG_CARD
-        ).pack(anchor="w", pady=(0, 8))
-
-        tk.Label(parent, text="Preset de Resolução da Câmera:", bg=BG_CARD, fg=FG_MUTED).pack(anchor="w")
-        res_cb = ttk.Combobox(parent, textvariable=self.res_preset_var, values=list(RESOLUTION_PRESETS.keys()), state="readonly")
-        res_cb.pack(fill=tk.X, pady=(2, 8))
-        res_cb.bind("<<ComboboxSelected>>", lambda _e: self.apply_resolution_preset())
-
-        custom_res = tk.Frame(parent, bg=BG_CARD)
-        custom_res.pack(fill=tk.X, pady=(0, 10))
-        tk.Label(custom_res, text="Largura:", bg=BG_CARD, fg=FG_MUTED).pack(side=tk.LEFT)
-        _make_entry(custom_res, self.width_var, 6, self.apply_custom_resolution).pack(side=tk.LEFT, padx=(4, 8))
-        tk.Label(custom_res, text="Altura:", bg=BG_CARD, fg=FG_MUTED).pack(side=tk.LEFT)
-        _make_entry(custom_res, self.height_var, 6, self.apply_custom_resolution).pack(side=tk.LEFT, padx=(4, 8))
-        _make_btn(custom_res, "Aplicar Resolução", self.apply_custom_resolution, bg=ACCENT_BLUE, padx=8).pack(side=tk.LEFT)
-
-        self._build_fps_and_speed_controls(parent)
-
-    def _build_fps_and_speed_controls(self, parent: tk.Frame) -> None:
-        fps_hdr = tk.Frame(parent, bg=BG_CARD)
-        fps_hdr.pack(fill=tk.X)
-        tk.Label(fps_hdr, text="Taxa de Quadros da Câmera (FPS):", bg=BG_CARD, fg=FG_MUTED).pack(side=tk.LEFT)
-        tk.Label(fps_hdr, textvariable=self.fps_label_var, bg=BG_CARD, fg="#38bdf8", font=("DejaVu Sans", 9, "bold")).pack(side=tk.RIGHT)
-        tk.Scale(
-            parent, from_=1, to=60, orient=tk.HORIZONTAL, variable=self.fps_var, showvalue=False, bg=BG_CARD, fg=FG_PRIMARY, highlightthickness=0, troughcolor=BG_INPUT, command=lambda val: self.set_fps(int(float(val)))
-        ).pack(fill=tk.X, pady=(2, 6))
-
-        chips = tk.Frame(parent, bg=BG_CARD)
-        chips.pack(fill=tk.X, pady=(0, 10))
-        for fps_val in FPS_PRESETS:
-            _make_btn(chips, f"{fps_val} FPS", lambda f=fps_val: self.set_fps(f), padx=6, pady=3, font=("DejaVu Sans", 8)).pack(side=tk.LEFT, padx=2)
-
-        tk.Checkbutton(
-            parent, text="Exibir HUD de Telemetria sobre o Vídeo", variable=self.hud_enabled_var, command=self.apply_hud_setting, bg=BG_CARD, fg=FG_PRIMARY, selectcolor=BG_INPUT, activebackground=BG_CARD
-        ).pack(anchor="w", pady=(0, 8))
-
-        tk.Label(parent, text="Fonte de Captura (camera = Webcam Pessoal):", bg=BG_CARD, fg=FG_MUTED).pack(anchor="w")
-        src_cb = ttk.Combobox(parent, textvariable=self.source_var, values=["camera", "simulator"], state="readonly")
-        src_cb.pack(fill=tk.X, pady=(2, 4))
-        src_cb.bind("<<ComboboxSelected>>", lambda _e: self.apply_source_and_scenario())
-
-    def _build_thermal_tab(self, parent: tk.Frame) -> None:
-        tk.Label(parent, text="Simulador Térmico da Câmera Pessoal", bg=BG_CARD, fg=FG_PRIMARY, font=("DejaVu Sans", 11, "bold")).pack(anchor="w", pady=(0, 6))
-        tk.Label(parent, text="Perfis Rápidos de Temperatura:", bg=BG_CARD, fg=FG_MUTED).pack(anchor="w")
-        prof_row = tk.Frame(parent, bg=BG_CARD)
-        prof_row.pack(fill=tk.X, pady=(2, 8))
-        _make_btn(prof_row, "Corporal (20–42°C)", lambda: self.apply_thermal_profile("human"), bg=ACCENT_BLUE, padx=6, pady=3, font=("DejaVu Sans", 8, "bold")).pack(side=tk.LEFT, padx=(0, 4))
-        _make_btn(prof_row, "Ambiente (18–65°C)", lambda: self.apply_thermal_profile("ambient"), padx=6, pady=3, font=("DejaVu Sans", 8)).pack(side=tk.LEFT, padx=(0, 4))
-        _make_btn(prof_row, "Alta Temp (22–120°C)", lambda: self.apply_thermal_profile("industrial"), padx=6, pady=3, font=("DejaVu Sans", 8)).pack(side=tk.LEFT)
-
-        tk.Label(parent, text="Paleta da Câmera Térmica Simulada:", bg=BG_CARD, fg=FG_MUTED).pack(anchor="w")
-        pal_cb = ttk.Combobox(parent, textvariable=self.palette_var, values=list(PALETTE_MAP.keys()), state="readonly")
-        pal_cb.pack(fill=tk.X, pady=(2, 8))
-        pal_cb.bind("<<ComboboxSelected>>", lambda _e: self.apply_thermal_settings())
-
-        temp_grid = tk.Frame(parent, bg=BG_CARD)
-        temp_grid.pack(fill=tk.X, pady=(0, 6))
-        for idx, (lbl, var) in enumerate([("Temp. Mín (°C):", self.temp_min_var), ("Temp. Máx (°C):", self.temp_max_var), ("Alarme (°C):", self.temp_alarm_var)]):
-            tk.Label(temp_grid, text=lbl, bg=BG_CARD, fg=FG_MUTED).grid(row=idx, column=0, sticky="w", pady=3)
-            _make_entry(temp_grid, var, 10, self.apply_thermal_settings).grid(row=idx, column=1, sticky="w", padx=8, pady=3)
-        _make_btn(parent, "Aplicar Escala de Temperatura", self.apply_thermal_settings, bg=ACCENT_BLUE, padx=10, pady=4).pack(anchor="w", pady=(2, 8))
-
-        kin_hdr = tk.Frame(parent, bg=BG_CARD)
-        kin_hdr.pack(fill=tk.X)
-        tk.Label(kin_hdr, text="Calor Gerado pelos Movimentos:", bg=BG_CARD, fg=FG_MUTED).pack(side=tk.LEFT)
-        tk.Label(kin_hdr, textvariable=self.kinetic_label_var, bg=BG_CARD, fg=FG_PRIMARY).pack(side=tk.RIGHT)
-        tk.Scale(
-            parent, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.kinetic_heat_var, showvalue=False, bg=BG_CARD, fg=FG_PRIMARY, highlightthickness=0, troughcolor=BG_INPUT, command=lambda _v: self.apply_thermal_settings()
-        ).pack(fill=tk.X, pady=(2, 8))
-
-        for text, var in [
-            ("Exibir Miras Hotspot / Coldspot", self.show_hotspots_var),
-            ("Exibir Contorno de Isoterma Crítica", self.show_isotherms_var),
-            ("Exibir Barra de Escala Térmica (°C)", self.show_scale_var),
-        ]:
-            tk.Checkbutton(parent, text=text, variable=var, command=self.apply_thermal_settings, bg=BG_CARD, fg=FG_PRIMARY, selectcolor=BG_INPUT, activebackground=BG_CARD).pack(anchor="w", pady=2)
-
-    def _build_motion_tab(self, parent: tk.Frame) -> None:
-        tk.Label(parent, text="Análise de Movimentos & Zona ROI", bg=BG_CARD, fg=FG_PRIMARY, font=("DejaVu Sans", 11, "bold")).pack(anchor="w", pady=(0, 8))
-        tk.Label(parent, text="Algoritmo de Detecção de Movimento:", bg=BG_CARD, fg=FG_MUTED).pack(anchor="w")
-        alg_cb = ttk.Combobox(parent, textvariable=self.algorithm_var, values=["frame_diff", "mog2", "knn"], state="readonly")
-        alg_cb.pack(fill=tk.X, pady=(2, 10))
-        alg_cb.bind("<<ComboboxSelected>>", lambda _e: self.apply_motion_settings())
-
-        sens_hdr = tk.Frame(parent, bg=BG_CARD)
-        sens_hdr.pack(fill=tk.X)
-        tk.Label(sens_hdr, text="Sensibilidade aos Movimentos:", bg=BG_CARD, fg=FG_MUTED).pack(side=tk.LEFT)
-        tk.Label(sens_hdr, textvariable=self.sensitivity_label_var, bg=BG_CARD, fg=FG_PRIMARY).pack(side=tk.RIGHT)
-        tk.Scale(
-            parent, from_=1, to=100, orient=tk.HORIZONTAL, variable=self.sensitivity_var, showvalue=False, bg=BG_CARD, fg=FG_PRIMARY, highlightthickness=0, troughcolor=BG_INPUT, command=lambda _v: self.apply_motion_settings()
-        ).pack(fill=tk.X, pady=(2, 10))
-
-        m_grid = tk.Frame(parent, bg=BG_CARD)
-        m_grid.pack(fill=tk.X, pady=(0, 8))
-        tk.Label(m_grid, text="Área Mínima (px²):", bg=BG_CARD, fg=FG_MUTED).grid(row=0, column=0, sticky="w", pady=3)
-        _make_entry(m_grid, self.min_area_var, 10, self.apply_motion_settings).grid(row=0, column=1, sticky="w", padx=8, pady=3)
-        tk.Label(m_grid, text="Limiar de Alarme (% área):", bg=BG_CARD, fg=FG_MUTED).grid(row=1, column=0, sticky="w", pady=3)
-        _make_entry(m_grid, self.alarm_pct_var, 10, self.apply_motion_settings).grid(row=1, column=1, sticky="w", padx=8, pady=3)
-        _make_btn(parent, "Aplicar Filtros de Movimento", self.apply_motion_settings, bg=ACCENT_BLUE, padx=10, pady=4).pack(anchor="w", pady=(2, 10))
-
-        for text, var in [
-            ("Destacar Objetos em Movimento (Boxes)", self.show_boxes_var),
-            ("Rastrear Trilha de Movimento", self.show_trails_var),
-            ("Restringir Análise à Zona ROI", self.roi_enabled_var),
-        ]:
-            tk.Checkbutton(parent, text=text, variable=var, command=self.apply_motion_settings, bg=BG_CARD, fg=FG_PRIMARY, selectcolor=BG_INPUT, activebackground=BG_CARD).pack(anchor="w", pady=2)
-        _make_btn(parent, "Resetar Zona ROI Padrão (80% Central)", self.reset_roi, padx=10, pady=4).pack(anchor="w", pady=(8, 4))
+        build_camera_tab(self, tab_cam)
+        build_thermal_tab(self, tab_thermal)
+        build_motion_tab(self, tab_motion)
 
     @staticmethod
     def _is_text_input_event(event: Any) -> bool:
@@ -714,6 +545,17 @@ class IndustrialVisionDesktopApp:
         mas KPIs e lista de eventos só nos intervalos de atualização definidos.
         """
         frame_bgr, tel = self.manager.step_frame()
+        self.present_frame(frame_bgr, tel, throttled=throttled)
+        return tel
+
+    def attach_frame_pump(self, pump: FramePump) -> None:
+        """Registra a thread de processamento para ser encerrada junto com a janela."""
+        self._frame_pump = pump
+
+    def present_frame(
+        self, frame_bgr: np.ndarray, tel: FrameTelemetry, *, throttled: bool = False
+    ) -> None:
+        """Exibe um quadro já processado e atualiza KPIs e eventos."""
         self._render_canvas_frame(frame_bgr)
         now = time.perf_counter()
         if not throttled or (now - self._last_telemetry_refresh) >= TELEMETRY_REFRESH_SEC:
@@ -722,7 +564,6 @@ class IndustrialVisionDesktopApp:
         if not throttled or (now - self._last_events_refresh) >= EVENTS_REFRESH_SEC:
             self._last_events_refresh = now
             self._refresh_events_listbox(self.manager.get_events(limit=EVENTS_VISIBLE_LIMIT))
-        return tel
 
     def _render_canvas_frame(
         self, frame_bgr: np.ndarray, canvas_size: tuple[int, int] | None = None
@@ -820,6 +661,10 @@ class IndustrialVisionDesktopApp:
             with contextlib.suppress(tk.TclError):
                 self.root.after_cancel(self._after_id)
             self._after_id = None
+        if self._frame_pump is not None:
+            # Antes de liberar a câmera: um passo em andamento a reabriria.
+            self._frame_pump.stop()
+            self._frame_pump = None
         self.manager.close()
         with contextlib.suppress(tk.TclError):
             self.root.destroy()
@@ -830,9 +675,15 @@ def run_native_app(
     max_frames: int | None = None,
     start_hidden: bool = False,
     snapshot_dir: Path | None = None,
+    on_exit: Callable[[SystemConfig], None] | None = None,
+    event_sink: Callable[[EventRecord], None] | None = None,
 ) -> int:
-    """Executa o aplicativo desktop local completo e retorna o total de quadros exibidos."""
-    manager = CameraManager(config or SystemConfig())
+    """Executa o aplicativo desktop local completo e retorna o total de quadros exibidos.
+
+    `on_exit` recebe a configuração final ao fechar (usado para salvá-la em disco)
+    e `event_sink` recebe cada evento registrado.
+    """
+    manager = CameraManager(config or SystemConfig(), event_sink=event_sink)
     try:
         app = IndustrialVisionDesktopApp(
             manager=manager, snapshot_dir=snapshot_dir, start_hidden=start_hidden
@@ -844,23 +695,35 @@ def run_native_app(
             "Verifique a variável $DISPLAY ou utilize o modo servidor Web ('python main.py')."
         ) from exc
 
-    frames_processed = 0
+    pump = FramePump(manager)
+    app.attach_frame_pump(pump)
+    frames_shown = 0
+    shown_sequence = 0
 
     def _tick() -> None:
-        nonlocal frames_processed
+        nonlocal frames_shown, shown_sequence
         if app._closed:
             return
-        t0 = time.perf_counter()
-        if not app.is_paused:
-            app.step_once(throttled=True)
-            frames_processed += 1
-            if max_frames is not None and frames_processed >= max_frames:
+        pump.set_paused(app.is_paused)
+        latest = pump.poll()
+        if latest is not None and latest.sequence != shown_sequence and not app.is_paused:
+            shown_sequence = latest.sequence
+            app.present_frame(latest.frame_bgr, latest.telemetry, throttled=True)
+            frames_shown += 1
+            if max_frames is not None and frames_shown >= max_frames:
                 app.close()
                 return
-        elapsed = time.perf_counter() - t0
-        delay_ms = max(MIN_IDLE_MS, round((app.manager.get_frame_interval_sec() - elapsed) * 1000))
-        app._after_id = app.root.after(delay_ms, _tick)
+        # Consulta duas vezes por intervalo de quadro para não perder quadros prontos.
+        interval_ms = app.manager.get_frame_interval_sec() * 1000.0
+        poll_ms = max(MIN_IDLE_MS, min(MAX_POLL_MS, round(interval_ms / 2)))
+        app._after_id = app.root.after(poll_ms, _tick)
 
-    app._after_id = app.root.after(10, _tick)
-    app.root.mainloop()
-    return frames_processed
+    pump.start()
+    app._after_id = app.root.after(MIN_IDLE_MS, _tick)
+    try:
+        app.root.mainloop()
+    finally:
+        app.close()
+        if on_exit is not None:
+            on_exit(manager.get_config())
+    return frames_shown

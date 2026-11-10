@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import logging
+import sys
 import time
 from collections import deque
 from collections.abc import Callable
@@ -18,6 +20,7 @@ from app.camera_capture import (
     DEFAULT_RETRY_INTERVAL_SEC,
     BackgroundCapture,
     apply_capture_format,
+    choose_hardware_fps,
     open_camera_device,
     release_capture,
 )
@@ -32,6 +35,8 @@ from app.hud_renderer import HudRenderer
 from app.industrial_sim import AnomalyType, IndustrialSceneSimulator
 from app.motion_detector import MotionDetector, MotionResult
 from app.thermal_simulator import ThermalResult, ThermalSimulator
+
+logger = logging.getLogger(__name__)
 
 MAX_EVENT_LOGS = 200
 FPS_WINDOW_SIZE = 30
@@ -54,14 +59,19 @@ class CameraManager:
         capture_factory: Callable[[int], Any] | None = None,
         camera_retry_interval_sec: float | None = None,
         background_capture: bool | None = None,
+        event_sink: Callable[[EventRecord], None] | None = None,
     ) -> None:
         """Cria o controlador.
+
+        `event_sink` recebe cada evento registrado (ex.: gravação em disco).
 
         `capture_factory` substitui a abertura da câmera (testes). Com a câmera
         real a captura roda em thread dedicada; `background_capture` força ou
         desativa esse modo independentemente da fábrica usada.
         """
         self._lock = RLock()
+        self._closed = False
+        self._event_sink = event_sink
         self._config: SystemConfig = initial_config or SystemConfig()
         self._capture_factory: Callable[[int], Any] | None = capture_factory
         self._use_background_capture: bool = (
@@ -80,7 +90,7 @@ class CameraManager:
         self._opened_camera_index: int | None = None
         self._applied_hw_props: tuple[int, int, int] | None = None
         self._bg_capture: BackgroundCapture | None = None
-        self._bg_format: tuple[int, int, int] | None = None
+        self._bg_format: tuple[int, int, int, int] | None = None
         self._bg_started_ts: float = 0.0
         self._lingering_capture_thread: Any = None
         self._camera_connecting: bool = False
@@ -332,6 +342,8 @@ class CameraManager:
     @staticmethod
     def get_camera_device_label(camera_index: int = 0) -> str:
         """Retorna o nome amigável do dispositivo de câmera pessoal (ex: /dev/video0)."""
+        if not sys.platform.startswith("linux"):
+            return f"Câmera #{camera_index}"
         sys_name_path = Path(f"/sys/class/video4linux/video{camera_index}/name")
         if sys_name_path.exists():
             with contextlib.suppress(OSError):
@@ -368,10 +380,12 @@ class CameraManager:
                     }
                 )
         if not devices:
+            # Sem enumeração V4L2 (outros sistemas ou nenhuma câmera): oferece o índice 0.
+            is_linux = sys.platform.startswith("linux")
             devices.append(
                 {
                     "index": 0,
-                    "device": "/dev/video0",
+                    "device": "/dev/video0" if is_linux else "camera:0",
                     "label": cls.get_camera_device_label(0),
                 }
             )
@@ -405,8 +419,9 @@ class CameraManager:
             return ok
 
     def close(self) -> None:
-        """Libera recursos de hardware da câmera física se estiverem abertos."""
+        """Libera a câmera física em definitivo; passos posteriores não a reabrem."""
         with self._lock:
+            self._closed = True
             self._release_camera()
 
     def _acquire_raw_frame(
@@ -519,6 +534,9 @@ class CameraManager:
         `wait_for_open` bloqueia até o primeiro quadro (reconexão pedida pelo
         usuário, que espera um resultado); o laço de vídeo nunca bloqueia.
         """
+        if self._closed:
+            # Um passo atrasado de outra thread não pode religar a câmera já liberada.
+            return None
         if self._use_background_capture:
             return self._read_background_camera(cfg, wait_for_open=wait_for_open)
         frame = self._read_sync_camera(cfg)
@@ -531,7 +549,8 @@ class CameraManager:
         self, cfg: SystemConfig, *, wait_for_open: bool = False
     ) -> np.ndarray | None:
         """Consulta, sem bloquear, o quadro mais recente da thread de captura."""
-        hw_format = (cfg.camera_index, cfg.width, cfg.height)
+        hardware_fps = choose_hardware_fps(cfg.target_fps)
+        hw_format = (cfg.camera_index, cfg.width, cfg.height, hardware_fps)
         if self._bg_capture is None or self._bg_format != hw_format:
             self._release_camera()
             self._bg_capture = BackgroundCapture(
@@ -539,6 +558,7 @@ class CameraManager:
                 cfg.camera_index,
                 cfg.width,
                 cfg.height,
+                fps=hardware_fps,
                 retry_interval_sec=self._camera_retry_interval_sec,
                 predecessor=self._lingering_capture_thread,
             )
@@ -739,3 +759,10 @@ class CameraManager:
         )
         self._next_event_id += 1
         self._events.append(ev)
+        if self._event_sink is not None:
+            try:
+                self._event_sink(ev)
+            except Exception:
+                # Falha ao persistir um evento não pode interromper o vídeo.
+                logger.exception("Falha no destino de eventos; persistência desativada")
+                self._event_sink = None

@@ -129,7 +129,9 @@ def test_cli_main_desktop_gui_and_server_modes(monkeypatch):
     called = {"gui": False, "uvicorn": False}
     monkeypatch.setattr(cli_mod, "run_desktop_gui", lambda cfg: called.__setitem__("gui", True))
     monkeypatch.setattr(
-        uvicorn, "run", lambda app, host, port, log_level: called.__setitem__("uvicorn", True)
+        uvicorn,
+        "run",
+        lambda app, host, port, log_level, access_log: called.__setitem__("uvicorn", access_log),
     )
 
     assert main(["--desktop-gui", "--resolution", "320x240"]) == 0
@@ -137,3 +139,7 @@ def test_cli_main_desktop_gui_and_server_modes(monkeypatch):
 
     assert main(["--host", "127.0.0.1", "--port", "8765"]) == 0
     assert called["uvicorn"] is True
+
+    # Com token, o log de acesso é desligado para não registrar a URL "?token=..."
+    assert main(["--host", "0.0.0.0", "--port", "8765"]) == 0
+    assert called["uvicorn"] is False

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
+import secrets
 import sys
 import time
 from collections.abc import Sequence
@@ -17,13 +19,27 @@ from app.api import create_app
 from app.camera_manager import CameraManager
 from app.config import LITE_MODE_PATCH, RESOLUTION_PRESETS, SystemConfig
 from app.desktop_app import run_native_app
+from app.persistence import (
+    CONFIG_FILE_NAME,
+    EVENTS_FILE_NAME,
+    EventLog,
+    get_data_dir,
+    load_config,
+    save_config,
+)
 from app.thermal_simulator import PALETTE_MAP
+
+
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+API_TOKEN_ENV = "VISAO_API_TOKEN"
+GENERATED_TOKEN_BYTES = 24
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Analisa argumentos de linha de comando."""
     parser = argparse.ArgumentParser(
-        description="Sistema de Visão Industrial — Detecção de Movimento & Termografia Simulada"
+        description="Sistema de Visão Industrial — Detecção de Movimento & Termografia Simulada",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--host", default="127.0.0.1", help="Host para o servidor Web SCADA (padrão: 127.0.0.1)"
@@ -102,6 +118,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Modo leve para computadores modestos (320x240 @ 15 FPS, sem trilhas)",
     )
     parser.add_argument(
+        "--no-persist",
+        action="store_true",
+        help="Não carrega nem salva a configuração e o histórico de eventos em disco",
+    )
+    parser.add_argument(
+        "--api-token",
+        default="",
+        help=(
+            "Token exigido pelo painel Web (ou variável VISAO_API_TOKEN). "
+            "Fora de 127.0.0.1, um token é gerado automaticamente se nenhum for informado"
+        ),
+    )
+    parser.add_argument(
         "--max-frames",
         type=int,
         default=0,
@@ -125,6 +154,50 @@ def build_initial_config(args: argparse.Namespace) -> SystemConfig:
         simulator={"scenario": args.scenario},
     )
     return base.apply_patch(LITE_MODE_PATCH) if getattr(args, "lite", False) else base
+
+
+def _flag_given(argv: Sequence[str], flag: str) -> bool:
+    return any(token == flag or token.startswith(flag + "=") for token in argv)
+
+
+def build_explicit_patch(args: argparse.Namespace, argv: Sequence[str]) -> dict[str, Any]:
+    """Patch só com as opções que o usuário digitou, para sobrepor a configuração salva."""
+    flag_patches: tuple[tuple[str, dict[str, Any]], ...] = (
+        ("--source", {"source": args.source}),
+        ("--camera-index", {"camera_index": args.camera_index}),
+        ("--no-mirror", {"mirror": False}),
+        ("--resolution", {"resolution_preset": args.resolution}),
+        ("--fps", {"target_fps": args.fps}),
+        ("--mode", {"vision_mode": args.mode}),
+        ("--palette", {"thermal": {"palette": args.palette}}),
+        ("--scenario", {"simulator": {"scenario": args.scenario}}),
+        ("--lite", LITE_MODE_PATCH),
+    )
+    patch: dict[str, Any] = {}
+    for flag, flag_patch in flag_patches:
+        if _flag_given(argv, flag):
+            patch = {**patch, **flag_patch}
+    return patch
+
+
+def resolve_startup_config(
+    args: argparse.Namespace, argv: Sequence[str], config_path: Path | None
+) -> SystemConfig:
+    """Configuração inicial: a salva em disco (se houver) com as opções digitadas por cima."""
+    saved = load_config(config_path) if config_path is not None else None
+    if saved is None:
+        return build_initial_config(args)
+    return saved.apply_patch(build_explicit_patch(args, argv))
+
+
+def resolve_api_token(args: argparse.Namespace) -> str | None:
+    """Token do painel Web: o informado, ou um gerado quando o host é acessível pela rede."""
+    token = args.api_token or os.environ.get(API_TOKEN_ENV, "")
+    if token:
+        return token
+    if args.host in LOOPBACK_HOSTS:
+        return None
+    return secrets.token_urlsafe(GENERATED_TOKEN_BYTES)
 
 
 def run_benchmark(
@@ -238,10 +311,11 @@ def run_desktop_gui(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Ponto de entrada principal da aplicação."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
-    cfg = build_initial_config(args)
 
     if args.benchmark_frames > 0:
+        cfg = build_initial_config(args)
         snap = Path(args.save_snapshot) if args.save_snapshot else None
         summary = run_benchmark(cfg, frames=args.benchmark_frames, snapshot_path=snap)
         print("=== Benchmark do Sistema de Visão Industrial ===")
@@ -250,10 +324,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     max_f = args.max_frames if args.max_frames > 0 else None
+    data_dir = None if args.no_persist else get_data_dir()
+    config_path = data_dir / CONFIG_FILE_NAME if data_dir is not None else None
+    event_sink = EventLog(data_dir / EVENTS_FILE_NAME).append if data_dir is not None else None
+    cfg = resolve_startup_config(args, raw_argv, config_path)
+
+    def persist_config(final_cfg: SystemConfig) -> None:
+        if config_path is not None:
+            save_config(final_cfg, config_path)
 
     if args.app:
         try:
-            run_native_app(cfg, max_frames=max_f)
+            run_native_app(cfg, max_frames=max_f, on_exit=persist_config, event_sink=event_sink)
         except RuntimeError as exc:
             print(f"Erro ao iniciar aplicativo desktop: {exc}", file=sys.stderr)
             return 1
@@ -266,7 +348,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_desktop_gui(cfg)
         return 0
 
-    manager = CameraManager(cfg)
-    fastapi_app = create_app(manager)
-    uvicorn.run(fastapi_app, host=args.host, port=args.port, log_level="info")
+    manager = CameraManager(cfg, event_sink=event_sink)
+    api_token = resolve_api_token(args)
+    if api_token and not (args.api_token or os.environ.get(API_TOKEN_ENV)):
+        print(
+            "Painel acessível pela rede: acesso protegido por token gerado.\n"
+            f"  Abra: http://{args.host}:{args.port}/?token={api_token}",
+            flush=True,
+        )
+    fastapi_app = create_app(manager, api_token=api_token)
+    try:
+        # Com token, o log de acesso registraria a URL "?token=..." da primeira visita.
+        uvicorn.run(
+            fastapi_app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            access_log=api_token is None,
+        )
+    finally:
+        persist_config(manager.get_config())
+        manager.close()
     return 0

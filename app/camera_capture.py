@@ -12,6 +12,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 CameraOpener = Callable[[int, int, int, int], Any]
 
 HARDWARE_FPS = 30
+LOW_HARDWARE_FPS = 15
 HARDWARE_BUFFER_FRAMES = 1
 DEFAULT_RETRY_INTERVAL_SEC = 1.0
 STALE_FRAME_SEC = 2.0
@@ -42,6 +44,21 @@ def apply_capture_format(cap: Any, width: int, height: int, fps: int) -> None:
         cap.set(cv2.CAP_PROP_FPS, float(fps))
 
 
+def preferred_backends() -> tuple[int, ...]:
+    """Backends de captura a tentar primeiro, conforme o sistema operacional."""
+    if sys.platform.startswith("linux"):
+        return (cv2.CAP_V4L2,)
+    if sys.platform == "win32":
+        # DirectShow abre webcams bem mais rápido que o backend padrão (MSMF).
+        return (cv2.CAP_DSHOW,)
+    return ()
+
+
+def choose_hardware_fps(target_fps: int) -> int:
+    """Taxa pedida ao hardware: reduzida quando o alvo é baixo, para decodificar menos."""
+    return LOW_HARDWARE_FPS if target_fps <= LOW_HARDWARE_FPS else HARDWARE_FPS
+
+
 def open_camera_device(camera_index: int, width: int, height: int, fps: int) -> Any:
     """Abre a câmera já na resolução pedida, em MJPG e com buffer mínimo.
 
@@ -50,23 +67,23 @@ def open_camera_device(camera_index: int, width: int, height: int, fps: int) -> 
     O formato vai junto com a abertura: configurar depois reinicia o stream do
     driver a cada propriedade e atrasa o primeiro quadro.
     """
-    if hasattr(cv2, "CAP_V4L2"):
-        open_params = [
-            cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"),
-            cv2.CAP_PROP_FRAME_WIDTH, int(width),
-            cv2.CAP_PROP_FRAME_HEIGHT, int(height),
-            cv2.CAP_PROP_FPS, int(fps),
-        ]  # fmt: skip
+    open_params = [
+        cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"),
+        cv2.CAP_PROP_FRAME_WIDTH, int(width),
+        cv2.CAP_PROP_FRAME_HEIGHT, int(height),
+        cv2.CAP_PROP_FPS, int(fps),
+    ]  # fmt: skip
+    for backend in preferred_backends():
         cap = None
         with contextlib.suppress(*CAPTURE_ERRORS):
-            cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2, open_params)
+            cap = cv2.VideoCapture(camera_index, backend, open_params)
         if cap is not None and cap.isOpened():
             with contextlib.suppress(*CAPTURE_ERRORS):
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, float(HARDWARE_BUFFER_FRAMES))
             return cap
         release_capture(cap)
 
-    # Outros sistemas (ou driver que recusou os parâmetros): abertura genérica.
+    # Backend preferido indisponível ou recusou os parâmetros: abertura genérica.
     cap = None
     with contextlib.suppress(*CAPTURE_ERRORS):
         cap = cv2.VideoCapture(camera_index)

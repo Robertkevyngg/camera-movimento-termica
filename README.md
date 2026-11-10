@@ -115,8 +115,23 @@ python desktop_app.py --lite
   exibido continua na resolução escolhida.
 - Os painéis de telemetria atualizam 4x por segundo e a lista de eventos 2x por
   segundo, em vez de a cada quadro.
+- Captura, análise e composição do vídeo rodam em uma thread própria; a janela só
+  exibe o quadro pronto e continua respondendo mesmo se um quadro demorar.
+- No Modo Leve (alvo de até 15 FPS) a webcam também é aberta a 15 FPS.
 - Com **Pillow** instalado o vídeo é desenhado cerca de 4x mais rápido; sem ele o
   app funciona pelo caminho PPM, mais lento.
+
+#### Configuração e histórico salvos
+Ao fechar, a configuração atual (resolução, FPS, modo, paleta, ROI...) é salva e
+restaurada na próxima abertura; opções digitadas na linha de comando têm prioridade.
+Os eventos são gravados em `eventos.jsonl` (limitado a ~1 MB).
+
+- Linux: `~/.config/sistema-visao-industrial/`
+- Windows: `%APPDATA%\sistema-visao-industrial\`
+- Outra pasta: variável `VISAO_DATA_DIR`. Para não ler nem gravar nada: `--no-persist`.
+
+No Windows, use `run_app.bat` no lugar de `run_app.sh` (suporte ainda não testado
+em uma máquina Windows).
 
 #### Atalhos do Teclado no App Desktop:
 - `1` : Modo Câmera Pessoal (Normal)
@@ -137,6 +152,22 @@ python main.py --host 127.0.0.1 --port 8000
 Acesse no seu navegador: **http://127.0.0.1:8000**
 
 ---
+
+#### Acesso pela rede
+Por padrão o painel só aceita conexões de `127.0.0.1` e não pede senha. Ao usar
+outro host (ex.: `--host 0.0.0.0`), todas as rotas passam a exigir um token:
+
+```bash
+# Token gerado automaticamente; o endereço completo é exibido no terminal
+python main.py --host 0.0.0.0
+
+# Ou defina o seu
+python main.py --host 0.0.0.0 --api-token "meu-token"   # ou variável VISAO_API_TOKEN
+```
+
+Abra `http://IP:8000/?token=SEU_TOKEN` uma vez; o navegador guarda um cookie e as
+próximas visitas dispensam o token. Clientes de API podem enviar o cabeçalho
+`X-API-Token`. A conexão é HTTP sem criptografia: use apenas em rede confiável.
 
 ### 3. Modo Janela Rápida OpenCV
 Para uma visualização leve diretamente via OpenCV:
@@ -168,6 +199,10 @@ sistema-visao-industrial/
 │   ├── cli.py               # Interface de linha de comando
 │   ├── config.py            # Modelos de configuração imutáveis (Pydantic)
 │   ├── desktop_app.py       # Aplicativo Desktop Nativo (Tkinter SCADA)
+│   ├── desktop_tabs.py      # Abas de controle (câmera, termografia, movimento)
+│   ├── desktop_widgets.py   # Tema, fábricas de widgets e geometria do vídeo
+│   ├── frame_pump.py        # Thread que processa o vídeo fora da interface
+│   ├── persistence.py       # Configuração e eventos salvos em disco
 │   ├── frame_utils.py       # Análise em resolução reduzida e percentis por histograma
 │   ├── hud_renderer.py      # Renderizador de camadas e informações na tela
 │   ├── motion_detector.py   # Motor de detecção e rastreamento de movimento
@@ -177,7 +212,8 @@ sistema-visao-industrial/
 ├── main.py                  # Ponto de entrada unificado
 ├── pyproject.toml           # Configuração de pacote Python
 ├── requirements.txt         # Lista de dependências
-├── run_app.sh               # Script de execução rápida do app local
+├── run_app.sh               # Script de execução rápida do app local (Linux)
+├── run_app.bat              # Script de execução rápida do app local (Windows)
 └── tests/                   # Suíte de testes unitários e de integração
 ```
 

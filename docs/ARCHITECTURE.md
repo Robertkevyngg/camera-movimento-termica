@@ -34,4 +34,7 @@ O sistema segue uma arquitetura modular em camadas com estado de configuração 
 - `app/camera_manager.py`: Controlador de captura e processamento com troca dinâmica de resolução/FPS, fallback automático de câmera física para simulador, histórico de eventos e captura de snapshots.
 - `app/camera_capture.py`: Thread dedicada que abre a câmera e lê quadros continuamente; o `CameraManager` só consulta o quadro mais recente, sem bloquear a interface em leituras lentas ou em câmera ausente.
 - `app/frame_utils.py`: Redução do quadro para a resolução de análise (largura máxima de 320 px) e cálculo de percentis por histograma, usados por movimento e termografia.
+- `app/frame_pump.py`: Thread que executa `CameraManager.step_frame` no ritmo do FPS alvo; o app desktop apenas exibe o quadro pronto mais recente.
+- `app/persistence.py`: Leitura/gravação atômica da configuração (`config.json`) e histórico de eventos em JSON Lines com tamanho limitado.
+- `app/desktop_tabs.py` / `app/desktop_widgets.py`: Abas de controle, tema e geometria do vídeo, separados de `app/desktop_app.py`.
 - `app/api.py`: Servidor FastAPI fornecendo endpoints RESTful, stream de vídeo MJPEG (`/api/stream`) e arquivos estáticos da interface SCADA.
