@@ -10,3 +10,4 @@
 - [x] **Fase 8**: Testes e implementação de `app/api.py` + Interface SCADA (`app/static/*`) + CLI (`app/cli.py`, `main.py`).
 - [x] **Fase 9**: Execução da suíte completa de testes (`pytest --cov`), verificação de casos de borda e validação end-to-end do servidor local.
 - [x] **Fase 10**: Implementação do Aplicativo Desktop Nativo completo (`app/desktop_app.py`, `desktop_app.py`, `run_app.sh`, `SistemaVisaoIndustrial.desktop`) com interface gráfica Tkinter SCADA, seleção de ROI via mouse, controles completos de resolução/FPS/termografia/movimento e suíte de testes (`tests/test_desktop_app.py`).
+- [x] **Fase 11**: Tempo real em 1080p a 60 FPS: câmera pedida a 60 FPS, quadros JPEG direto da câmera e relógio do driver (Linux), FPS fixo e gravação em vídeo dos eventos de movimento sem perda de quadros (`app/event_recorder.py`, `tests/test_event_recorder.py`).

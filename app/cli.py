@@ -21,6 +21,7 @@ from app.config import LITE_MODE_PATCH, RESOLUTION_PRESETS, SystemConfig
 from app.desktop_app import run_native_app
 from app.persistence import (
     CONFIG_FILE_NAME,
+    RECORDINGS_DIR_NAME,
     EVENTS_FILE_NAME,
     EventLog,
     get_data_dir,
@@ -69,6 +70,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--fps", type=int, default=24, help="Taxa de quadros alvo inicial (1-60 FPS)"
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Grava em vídeo cada evento de movimento (câmera física; até 1080p a 60 FPS)",
+    )
+    parser.add_argument(
+        "--recordings-dir",
+        default="",
+        help="Pasta dos vídeos gravados (padrão: subpasta 'gravacoes' da pasta de dados)",
     )
     parser.add_argument(
         "--mode",
@@ -149,6 +160,7 @@ def build_initial_config(args: argparse.Namespace) -> SystemConfig:
         width=width,
         height=height,
         target_fps=args.fps,
+        record_events=getattr(args, "record", False),
         vision_mode=args.mode,
         thermal={"palette": args.palette},
         simulator={"scenario": args.scenario},
@@ -168,6 +180,7 @@ def build_explicit_patch(args: argparse.Namespace, argv: Sequence[str]) -> dict[
         ("--no-mirror", {"mirror": False}),
         ("--resolution", {"resolution_preset": args.resolution}),
         ("--fps", {"target_fps": args.fps}),
+        ("--record", {"record_events": True}),
         ("--mode", {"vision_mode": args.mode}),
         ("--palette", {"thermal": {"palette": args.palette}}),
         ("--scenario", {"simulator": {"scenario": args.scenario}}),
@@ -188,6 +201,13 @@ def resolve_startup_config(
     if saved is None:
         return build_initial_config(args)
     return saved.apply_patch(build_explicit_patch(args, argv))
+
+
+def resolve_recordings_dir(args: argparse.Namespace) -> Path:
+    """Pasta dos vídeos de eventos: a informada ou `gravacoes` na pasta de dados."""
+    if args.recordings_dir:
+        return Path(args.recordings_dir).expanduser()
+    return get_data_dir() / RECORDINGS_DIR_NAME
 
 
 def resolve_api_token(args: argparse.Namespace) -> str | None:
@@ -328,6 +348,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_path = data_dir / CONFIG_FILE_NAME if data_dir is not None else None
     event_sink = EventLog(data_dir / EVENTS_FILE_NAME).append if data_dir is not None else None
     cfg = resolve_startup_config(args, raw_argv, config_path)
+    recordings_dir = resolve_recordings_dir(args)
+    if cfg.record_events:
+        print(f"Vídeos dos movimentos em: {recordings_dir}", flush=True)
 
     def persist_config(final_cfg: SystemConfig) -> None:
         if config_path is not None:
@@ -335,7 +358,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.app:
         try:
-            run_native_app(cfg, max_frames=max_f, on_exit=persist_config, event_sink=event_sink)
+            run_native_app(
+                cfg,
+                max_frames=max_f,
+                on_exit=persist_config,
+                event_sink=event_sink,
+                recordings_dir=recordings_dir,
+            )
         except RuntimeError as exc:
             print(f"Erro ao iniciar aplicativo desktop: {exc}", file=sys.stderr)
             return 1
@@ -348,7 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_desktop_gui(cfg)
         return 0
 
-    manager = CameraManager(cfg, event_sink=event_sink)
+    manager = CameraManager(cfg, event_sink=event_sink, recordings_dir=recordings_dir)
     api_token = resolve_api_token(args)
     if api_token and not (args.api_token or os.environ.get(API_TOKEN_ENV)):
         print(

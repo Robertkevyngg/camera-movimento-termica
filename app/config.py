@@ -167,6 +167,11 @@ class SystemConfig(BaseModel):
     motion: MotionConfig = Field(default_factory=MotionConfig)
     thermal: ThermalConfig = Field(default_factory=ThermalConfig)
     simulator: SimulatorConfig = Field(default_factory=SimulatorConfig)
+    # Gravação em vídeo dos eventos de movimento (câmera física): começa
+    # `record_pre_sec` antes do movimento e termina `record_post_sec` depois dele.
+    record_events: bool = False
+    record_pre_sec: float = Field(default=2.0, ge=0.0, le=10.0)
+    record_post_sec: float = Field(default=3.0, ge=0.5, le=60.0)
 
     def with_resolution(self, width: int, height: int) -> SystemConfig:
         """Retorna uma nova instância de SystemConfig com a resolução informada."""
@@ -273,6 +278,9 @@ class FrameTelemetry(BaseModel):
     coldspot_y: int
     overheat_alarm: bool
     alert_level: AlertLevel
+    camera_fps: float = 0.0  # quadros por segundo entregues pela câmera física
+    recording: bool = False  # gravando vídeo de um evento agora
+    recording_dropped: int = 0  # quadros que a gravação não conseguiu acompanhar
 
 
 class EventRecord(BaseModel):

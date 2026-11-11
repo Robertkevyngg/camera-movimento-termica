@@ -73,6 +73,9 @@ def build_fps_and_speed_controls(ui: DesktopControls, parent: tk.Frame) -> None:
     tk.Checkbutton(
         parent, text="Exibir HUD de Telemetria sobre o Vídeo", variable=ui.hud_enabled_var, command=ui.apply_hud_setting, bg=BG_CARD, fg=FG_PRIMARY, selectcolor=BG_INPUT, activebackground=BG_CARD
     ).pack(anchor="w", pady=(0, 8))
+    tk.Checkbutton(
+        parent, text="Gravar Vídeo dos Movimentos (câmera física)", variable=ui.record_events_var, command=ui.apply_record_setting, bg=BG_CARD, fg=FG_PRIMARY, selectcolor=BG_INPUT, activebackground=BG_CARD
+    ).pack(anchor="w", pady=(0, 8))
 
     tk.Label(parent, text="Fonte de Captura (camera = Webcam Pessoal):", bg=BG_CARD, fg=FG_MUTED).pack(anchor="w")
     src_cb = ttk.Combobox(parent, textvariable=ui.source_var, values=["camera", "simulator"], state="readonly")
