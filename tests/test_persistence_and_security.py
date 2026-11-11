@@ -160,7 +160,7 @@ def test_explicit_patch_only_contains_typed_flags():
 def test_main_persists_final_config_and_respects_no_persist(monkeypatch, isolated_data_dir: Path):
     import app.cli as cli_module
 
-    def fake_app(config, max_frames=None, on_exit=None, event_sink=None):
+    def fake_app(config, max_frames=None, on_exit=None, event_sink=None, recordings_dir=None):
         on_exit(config.apply_patch({"vision_mode": "hybrid"}))
         return 0
 
@@ -299,11 +299,14 @@ def test_run_native_app_reports_final_config_and_events_on_exit(tmp_path: Path):
     assert events and "Sistema iniciado" in events[0].message
 
 
-def test_hardware_fps_follows_low_targets():
+def test_hardware_fps_follows_target():
     assert choose_hardware_fps(15) == 15
     assert choose_hardware_fps(5) == 15
     assert choose_hardware_fps(24) == 30
-    assert choose_hardware_fps(60) == 30
+    assert choose_hardware_fps(30) == 30
+    # Acima de 30, a câmera é pedida a 60 (antes ficava presa em 30).
+    assert choose_hardware_fps(45) == 60
+    assert choose_hardware_fps(60) == 60
 
 
 def test_camera_backends_and_labels_adapt_to_platform(monkeypatch):

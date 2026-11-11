@@ -40,8 +40,22 @@ Sistema de visão computacional em Python projetado para operar **localmente** u
 4. **Controle Dinâmico de Resolução e FPS**:
    - Alterne instantaneamente entre resoluções pré-definidas (`320x240`, `640x480`, `800x600`, `960x540`, `1280x720`, `1920x1080`) ou defina uma resolução personalizada.
    - Controle dinâmico de taxa de quadros de **1 a 60 FPS** com sincronização temporal precisa.
+   - Acima de 30 FPS a câmera é pedida a **60 FPS de verdade** (ex.: Logitech StreamCam/Brio em 1080p60).
 
-5. **4 Modos de Visão**:
+6. **Gravação em Vídeo dos Movimentos (tempo real, até 1080p a 60 FPS)**:
+   - Ligue com `--record`, ou na opção *Gravar Vídeo dos Movimentos* do app desktop e do painel web.
+   - Cada evento de movimento vira um vídeo que começa **2 s antes** do movimento e termina **3 s depois**
+     (`record_pre_sec` / `record_post_sec`). A thread de captura entrega **todos** os quadros à gravação,
+     mesmo os que a análise não chegou a usar: o vídeo mostra o movimento real, quadro a quadro.
+   - **No Linux**, os quadros JPEG que a câmera já envia (MJPG) são gravados direto num `.avi`, **sem
+     recomprimir**: custo de CPU quase zero e a qualidade original da câmera. Nos demais casos, `.mp4`.
+   - Junto de cada vídeo vai `<vídeo>_tempos.csv` com o horário de cada quadro em milissegundos; no Linux
+     o horário vem do próprio driver da câmera, verdadeiro mesmo se o computador atrasar.
+   - No Linux a câmera recebe **FPS fixo** (não cai para 30 FPS com pouca luz); o ajuste é desfeito ao sair.
+   - Os vídeos ficam na subpasta `gravacoes` da pasta de dados (ou em `--recordings-dir`). A telemetria
+     mostra o FPS real da câmera, `● REC` durante a gravação e quadros perdidos, se houver.
+
+7. **4 Modos de Visão**:
    - `normal`: Vídeo RGB original com caixas e rastreamento de movimento.
    - `thermal`: Visão termográfica simulada completa.
    - `hybrid`: Fusão termo-óptica (imagem real translúcida sobreposta ao mapa térmico com contornos destacados).

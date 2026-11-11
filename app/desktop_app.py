@@ -136,6 +136,7 @@ class IndustrialVisionDesktopApp:
         self.sim_speed_var = tk.DoubleVar(master=self.root, value=cfg.simulator.speed_multiplier)
         self.sim_speed_label_var = tk.StringVar(master=self.root, value=f"{cfg.simulator.speed_multiplier:.1f}x")
         self.hud_enabled_var = tk.BooleanVar(master=self.root, value=cfg.hud_enabled)
+        self.record_events_var = tk.BooleanVar(master=self.root, value=cfg.record_events)
 
         self.palette_var = tk.StringVar(master=self.root, value=cfg.thermal.palette)
         self.temp_min_var = tk.StringVar(master=self.root, value=str(cfg.thermal.min_temp_c))
@@ -319,6 +320,7 @@ class IndustrialVisionDesktopApp:
         self.sim_speed_var.set(cfg.simulator.speed_multiplier)
         self.sim_speed_label_var.set(f"{cfg.simulator.speed_multiplier:.1f}x")
         self.hud_enabled_var.set(cfg.hud_enabled)
+        self.record_events_var.set(cfg.record_events)
 
         self.palette_var.set(cfg.thermal.palette)
         self.temp_min_var.set(str(cfg.thermal.min_temp_c))
@@ -413,6 +415,9 @@ class IndustrialVisionDesktopApp:
 
     def apply_hud_setting(self) -> bool:
         return self._apply_patch_safely({"hud_enabled": bool(self.hud_enabled_var.get())})
+
+    def apply_record_setting(self) -> bool:
+        return self._apply_patch_safely({"record_events": bool(self.record_events_var.get())})
 
     def apply_source_and_scenario(self) -> bool:
         try:
@@ -616,7 +621,12 @@ class IndustrialVisionDesktopApp:
 
     def _update_telemetry_widgets(self, tel: FrameTelemetry) -> None:
         self._set_text("meta", self.stream_meta_var, f"{tel.width}x{tel.height} @ {tel.actual_fps:.1f} FPS")
-        self._set_text("fps", self.kpi_fps_var, f"{tel.actual_fps:.1f} / {tel.target_fps} FPS")
+        fps_text = f"{tel.actual_fps:.1f} / {tel.target_fps} FPS"
+        if tel.camera_fps > 0:
+            fps_text += f" (câmera {tel.camera_fps:.0f})"
+        if tel.recording:
+            fps_text += " ● REC"
+        self._set_text("fps", self.kpi_fps_var, fps_text)
         self._set_text("latency", self.kpi_latency_var, f"Processamento: {tel.processing_ms:.1f} ms")
         self._set_text("motion", self.kpi_motion_var, f"{tel.motion_percentage:.1f}%")
         self._set_text("objects", self.kpi_objects_var, f"{tel.object_count} objeto(s) em movimento")
@@ -677,13 +687,17 @@ def run_native_app(
     snapshot_dir: Path | None = None,
     on_exit: Callable[[SystemConfig], None] | None = None,
     event_sink: Callable[[EventRecord], None] | None = None,
+    recordings_dir: Path | None = None,
 ) -> int:
     """Executa o aplicativo desktop local completo e retorna o total de quadros exibidos.
 
     `on_exit` recebe a configuração final ao fechar (usado para salvá-la em disco)
-    e `event_sink` recebe cada evento registrado.
+    e `event_sink` recebe cada evento registrado. `recordings_dir` é a pasta dos
+    vídeos dos eventos de movimento (opção "Gravar vídeo dos movimentos").
     """
-    manager = CameraManager(config or SystemConfig(), event_sink=event_sink)
+    manager = CameraManager(
+        config or SystemConfig(), event_sink=event_sink, recordings_dir=recordings_dir
+    )
     try:
         app = IndustrialVisionDesktopApp(
             manager=manager, snapshot_dir=snapshot_dir, start_hidden=start_hidden

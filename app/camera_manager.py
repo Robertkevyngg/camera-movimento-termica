@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from app.config import (
     FrameTelemetry,
     SystemConfig,
 )
+from app.event_recorder import EventRecorder
 from app.hud_renderer import HudRenderer
 from app.industrial_sim import AnomalyType, IndustrialSceneSimulator
 from app.motion_detector import MotionDetector, MotionResult
@@ -60,10 +62,14 @@ class CameraManager:
         camera_retry_interval_sec: float | None = None,
         background_capture: bool | None = None,
         event_sink: Callable[[EventRecord], None] | None = None,
+        recordings_dir: Path | None = None,
     ) -> None:
         """Cria o controlador.
 
         `event_sink` recebe cada evento registrado (ex.: gravação em disco).
+
+        `recordings_dir` é a pasta dos vídeos dos eventos de movimento, gravados
+        quando `record_events` está ligado; sem ela a gravação fica indisponível.
 
         `capture_factory` substitui a abertura da câmera (testes). Com a câmera
         real a captura roda em thread dedicada; `background_capture` força ou
@@ -99,6 +105,13 @@ class CameraManager:
         self._cam_cache_seq: int | None = None
         self._cam_cache_frame: np.ndarray | None = None
         self._last_cam_frame_is_new: bool = True
+
+        self._recordings_dir = recordings_dir
+        self._recorder: EventRecorder | None = None
+        self._recording: bool = False
+        self._recording_base: Path | None = None
+        self._recording_started_mono: float = 0.0
+        self._last_motion_mono: float = 0.0
 
         self._simulator = IndustrialSceneSimulator()
         self._motion_detector = MotionDetector()
@@ -272,6 +285,7 @@ class CameraManager:
             )
 
             self._evaluate_alarm_transitions(telemetry)
+            self._update_recording(cfg, telemetry)
             self._latest_frame_bgr = rendered
             self._latest_telemetry = telemetry
             self._latest_stream_jpeg = None
@@ -422,7 +436,12 @@ class CameraManager:
         """Libera a câmera física em definitivo; passos posteriores não a reabrem."""
         with self._lock:
             self._closed = True
+            if self._recording:
+                self._finish_recording(time.monotonic())
+            recorder, self._recorder = self._recorder, None
             self._release_camera()
+        if recorder is not None:
+            recorder.close()  # termina de gravar os quadros que estavam na fila
 
     def _acquire_raw_frame(
         self, cfg: SystemConfig
@@ -561,6 +580,10 @@ class CameraManager:
                 fps=hardware_fps,
                 retry_interval_sec=self._camera_retry_interval_sec,
                 predecessor=self._lingering_capture_thread,
+                realtime_tuning=self._capture_factory is None,
+            )
+            self._bg_capture.frame_listener = (
+                self._recorder.receive if self._recorder is not None else None
             )
             self._bg_format = hw_format
             self._bg_capture.start()
@@ -619,6 +642,8 @@ class CameraManager:
             return self._mark_camera_failure()
 
         self._last_camera_fail_ts = 0.0
+        if self._recorder is not None:
+            self._recorder.receive(time.monotonic(), frame, None)
         return frame
 
     def _mark_camera_failure(self) -> None:
@@ -709,6 +734,9 @@ class CameraManager:
             coldspot_y=thermal.coldspot_y,
             overheat_alarm=thermal.overheat_alarm,
             alert_level=alert_level,
+            camera_fps=round(self._bg_capture.camera_fps, 1) if self._bg_capture is not None else 0.0,
+            recording=self._recording,
+            recording_dropped=self._recorder.dropped_frames if self._recorder is not None else 0,
         )
 
     def _evaluate_alarm_transitions(self, tel: FrameTelemetry) -> None:
@@ -741,6 +769,72 @@ class CameraManager:
                 },
             )
         self._prev_motion_alarm = tel.motion_alarm
+
+    def _update_recording(self, cfg: SystemConfig, tel: FrameTelemetry) -> None:
+        """Liga/desliga o gravador conforme a configuração e grava cada evento de movimento."""
+        wanted = cfg.record_events and cfg.source == "camera" and self._recordings_dir is not None
+        if wanted and self._recorder is None:
+            self._recorder = EventRecorder(self._camera_fps_estimate, pre_seconds=cfg.record_pre_sec)
+            if self._bg_capture is not None:
+                self._bg_capture.frame_listener = self._recorder.receive
+        elif not wanted and self._recorder is not None:
+            if self._recording:
+                self._finish_recording(time.monotonic())
+            recorder, self._recorder = self._recorder, None
+            if self._bg_capture is not None:
+                self._bg_capture.frame_listener = None
+            # Fechar espera a fila esvaziar: fora do laço de vídeo, para não engasgar a tela.
+            threading.Thread(target=recorder.close, name="fecha-gravacao").start()
+        if self._recorder is None:
+            return
+        self._recorder.pre_seconds = cfg.record_pre_sec
+        now = time.monotonic()
+        if tel.motion_alarm and tel.source_active == "camera":
+            self._last_motion_mono = now
+            if not self._recording:
+                self._begin_recording(now)
+        elif self._recording and now - self._last_motion_mono > cfg.record_post_sec:
+            self._finish_recording(now)
+
+    def _camera_fps_estimate(self) -> float:
+        """FPS real da câmera para o arquivo de vídeo (cai para o alvo antes de medir)."""
+        measured = self._bg_capture.camera_fps if self._bg_capture is not None else 0.0
+        if measured <= 0.0 and self._latest_telemetry is not None:
+            measured = self._latest_telemetry.actual_fps
+        return measured if measured > 0.0 else float(self._config.target_fps)
+
+    def _begin_recording(self, now: float) -> None:
+        assert self._recorder is not None and self._recordings_dir is not None
+        moment = datetime.now()
+        stamp = moment.strftime("%H-%M-%S-") + f"{moment.microsecond // 1000:03d}"
+        base = self._recordings_dir / moment.strftime("%Y-%m-%d") / f"{stamp}_movimento"
+        self._recorder.start(now, base)
+        self._recording = True
+        self._recording_base = base
+        self._recording_started_mono = now
+        raw = self._bg_capture is not None and self._bg_capture.raw_jpeg
+        self._record_event(
+            category="MOTION",
+            severity="ATENCAO",
+            message=f"Gravando vídeo do movimento: {base.name}{'.avi' if raw else '.mp4'}",
+            details={"arquivo": str(base), "jpeg_direto": raw},
+        )
+
+    def _finish_recording(self, now: float) -> None:
+        if self._recorder is not None:
+            self._recorder.stop(now)
+        self._recording = False
+        duration = now - self._recording_started_mono
+        self._record_event(
+            category="MOTION",
+            severity="NORMAL",
+            message=f"Vídeo do movimento salvo ({duration:.1f} s): {self._recording_base}",
+            details={
+                "arquivo": str(self._recording_base),
+                "duracao_s": round(duration, 2),
+                "quadros_perdidos": self._recorder.dropped_frames if self._recorder else 0,
+            },
+        )
 
     def _record_event(
         self,

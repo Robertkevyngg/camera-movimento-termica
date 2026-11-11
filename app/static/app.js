@@ -31,6 +31,9 @@
   function syncControlsFromConfig(cfg) {
     el("ctrl-source").value = cfg.source;
     el("ctrl-camera-index").value = cfg.camera_index;
+    if (el("ctrl-record")) {
+      el("ctrl-record").checked = Boolean(cfg.record_events);
+    }
     if (el("ctrl-mirror")) {
       el("ctrl-mirror").checked = Boolean(cfg.mirror);
     }
@@ -81,7 +84,10 @@
 
   function renderTelemetry(tel) {
     el("stream-res-label").textContent = `${tel.width}x${tel.height} @ ${tel.actual_fps.toFixed(1)} FPS`;
-    el("kpi-fps").textContent = `${tel.actual_fps.toFixed(1)} / ${tel.target_fps} FPS`;
+    let fpsText = `${tel.actual_fps.toFixed(1)} / ${tel.target_fps} FPS`;
+    if (tel.camera_fps > 0) fpsText += ` (câmera ${tel.camera_fps.toFixed(0)})`;
+    if (tel.recording) fpsText += " ● REC";
+    el("kpi-fps").textContent = fpsText;
     el("kpi-latency").textContent = `Processamento: ${tel.processing_ms.toFixed(1)} ms`;
     el("kpi-motion").textContent = `${tel.motion_percentage.toFixed(1)}%`;
     el("kpi-objects").textContent = `${tel.object_count} objeto(s) em movimento`;
@@ -181,6 +187,11 @@
       });
     }
 
+    if (el("ctrl-record")) {
+      el("ctrl-record").addEventListener("change", (e) =>
+        patchConfig({ record_events: e.target.checked })
+      );
+    }
     if (el("ctrl-mirror")) {
       el("ctrl-mirror").addEventListener("change", (e) =>
         patchConfig({ mirror: e.target.checked })
